@@ -1,0 +1,61 @@
+(.venv) PS C:\Users\User\Desktop\legacy-modernizer> python test_models.py
+nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B
+nvidia/Nemotron-3_5-Lightning
+nvidia/Nemotron-3-Ultra-550b-a55b
+nvidia/nemotron-3-super-120b-a12b
+
+
+Here’s the equivalent behavior written as a **React** component.  
+You don’t need jQuery at all – React lets you declare the click handler directly on the JSX element.
+
+```jsx
+import React from 'react';
+
+function MyButton() {
+  // Option 1: Inline arrow function (most common)
+  const handleClick = () => alert('hi');
+
+  return (
+    <button id="btn" onClick={handleClick}>
+      Click me
+    </button>
+  );
+}
+
+export default MyButton;
+```
+
+### Why this works
+* `onClick` is React’s synthetic‑event prop; it receives the same event object that jQuery would give you.
+* The function passed to `onClick` runs whenever the button is clicked—just like `$('#btn').on('click', …)` did.
+
+---
+
+#### If you *really* need a reference to the DOM node (e.g., to focus it imperatively)
+
+```jsx
+import React, { useRef } from 'react';
+
+function MyButtonWithRef() {
+  const btnRef = useRef(null);
+
+  const handleClick = () => {
+    alert('hi');
+    // Example of using the ref:
+    // btnRef.current.focus();
+  };
+
+  return (
+    <button
+      id="btn"
+      ref={btnRef}
+      onClick={handleClick}
+    >
+      Click me
+    </button>
+  );
+}
+```
+
+Both snippets produce the same user experience as the original jQuery line, but they follow React’s declarative style. Choose the first version unless you have a specific need to manipulate the DOM directly via a ref.
+(.venv) PS C:\Users\User\Desktop\legacy-modernizer> 

@@ -1,0 +1,6 @@
+openai
+tavily-python
+python-dotenv
+contree-sdk
+fastapi
+uvicorn
