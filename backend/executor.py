@@ -26,12 +26,18 @@ def load_plan() -> dict:
 def migrate_file(original_path: str, new_path: str, migration_notes: str, original_content: str) -> str:
     """Send one file to Super with its specific migration notes, get back the converted code."""
     system_msg = (
-        "You are an expert React developer performing a precise jQuery-to-React "
-        "migration for ONE file at a time. You will be given the original file's "
-        "content and specific migration notes for that file. "
-        "Respond with ONLY the final code for the new file — no markdown fences, "
-        "no explanation, no commentary. Just the raw file content, ready to write to disk."
-    )
+    "You are an expert React developer performing a precise jQuery-to-React "
+    "migration for ONE file at a time. You will be given the original file's "
+    "content and specific migration notes for that file. "
+    "IMPORTANT: Preserve all original `id` and `class`/`className` values EXACTLY "
+    "as they appear in the original file, even when restructuring the DOM or JSX. "
+    "The CSS file was migrated separately and still targets the original id/class "
+    "names — if you rename or drop them, the styling will break even though the "
+    "app still functions. Also preserve original visible text (button labels, "
+    "headings) exactly unless the migration notes explicitly say to change them. "
+    "Respond with ONLY the final code for the new file — no markdown fences, "
+    "no explanation, no commentary. Just the raw file content, ready to write to disk."
+)
     user_msg = (
         f"ORIGINAL FILE: {original_path}\n"
         f"NEW FILE PATH: {new_path}\n\n"
