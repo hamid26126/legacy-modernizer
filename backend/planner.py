@@ -82,31 +82,52 @@ def parse_json_response(raw: str) -> dict:
     return json.loads(text.strip())
 
 
-def get_migration_plan(force_refresh: bool = False) -> dict:
-    """Get the migration plan, using a cached copy if available so we don't
-    burn Ultra credits every time we re-run the pipeline during development."""
+def get_migration_plan_stream(force_refresh: bool = False):
+    """
+    Generator version — yields progress events as dicts so a web layer (or the
+    CLI) can show live status. The final event is always either
+    {"type": "plan_complete", "plan": {...}} or {"type": "error", "message": "..."}.
+    """
     if PLAN_CACHE.exists() and not force_refresh:
-        print("Using cached plan (delete plan_cache.json to force a fresh one).")
-        return json.loads(PLAN_CACHE.read_text())
+        yield {"type": "info", "message": "Using cached plan (delete plan_cache.json to force a fresh one)."}
+        yield {"type": "plan_complete", "plan": json.loads(PLAN_CACHE.read_text())}
+        return
 
-    print("Reading repo...")
-    repo_content = read_repo(REPO_PATH)
+    try:
+        yield {"type": "progress", "step": "reading_repo", "message": "Reading repo..."}
+        repo_content = read_repo(REPO_PATH)
 
-    print("Grounding with Tavily...")
-    tavily_context = ground_with_tavily("jQuery to React migration guide best practices 2026")
+        yield {"type": "progress", "step": "grounding", "message": "Grounding with Tavily..."}
+        tavily_context = ground_with_tavily("jQuery to React migration guide best practices 2026")
 
-    print("Calling Nemotron 3 Ultra for the migration plan (this costs credits)...")
-    messages = build_prompt(repo_content, tavily_context)
-    response = client.chat.completions.create(
-        model=ULTRA_MODEL,
-        messages=messages,
-        temperature=0.2,
-    )
-    raw = response.choices[0].message.content
-    plan = parse_json_response(raw)
+        yield {"type": "progress", "step": "planning", "message": "Calling Nemotron 3 Ultra for the migration plan (this costs credits)..."}
+        messages = build_prompt(repo_content, tavily_context)
+        response = client.chat.completions.create(
+            model=ULTRA_MODEL,
+            messages=messages,
+            temperature=0.2,
+        )
+        raw = response.choices[0].message.content
+        plan = parse_json_response(raw)
 
-    PLAN_CACHE.write_text(json.dumps(plan, indent=2))
-    print(f"Plan saved to {PLAN_CACHE}")
+        PLAN_CACHE.write_text(json.dumps(plan, indent=2))
+        yield {"type": "info", "message": f"Plan saved to {PLAN_CACHE}"}
+        yield {"type": "plan_complete", "plan": plan}
+
+    except Exception as e:
+        yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
+
+
+def get_migration_plan(force_refresh: bool = False) -> dict:
+    """CLI-friendly wrapper — consumes the stream, prints progress, returns the final plan."""
+    plan = None
+    for event in get_migration_plan_stream(force_refresh):
+        if event["type"] in ("progress", "info"):
+            print(event["message"])
+        elif event["type"] == "error":
+            raise RuntimeError(event["message"])
+        elif event["type"] == "plan_complete":
+            plan = event["plan"]
     return plan
 
 

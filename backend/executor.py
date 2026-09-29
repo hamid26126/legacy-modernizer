@@ -76,10 +76,18 @@ def run_checks(file_path: Path) -> bool:
     return True
 
 
-def execute_plan():
-    plan = load_plan()
-    files = sorted(plan["files"], key=lambda f: f["priority"])
+def execute_plan_stream():
+    """
+    Generator version — yields progress events per file. Final event is
+    {"type": "execution_complete", "results": [...]}.
+    """
+    try:
+        plan = load_plan()
+    except Exception as e:
+        yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
+        return
 
+    files = sorted(plan["files"], key=lambda f: f["priority"])
     OUTPUT_PATH.mkdir(exist_ok=True)
     results = []
 
@@ -88,27 +96,52 @@ def execute_plan():
         new_path = entry["new_path"]
         notes = entry["migration_notes"]
 
-        print(f"\nMigrating: {original_path} -> {new_path}")
-        original_full_path = REPO_PATH / original_path
-        original_content = original_full_path.read_text(encoding="utf-8")
+        yield {"type": "file_start", "file": original_path, "new_path": new_path}
 
-        migrated_content = migrate_file(original_path, new_path, notes, original_content)
+        try:
+            original_full_path = REPO_PATH / original_path
+            original_content = original_full_path.read_text(encoding="utf-8")
 
-        output_file = OUTPUT_PATH / new_path
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        output_file.write_text(migrated_content, encoding="utf-8")
-        print(f"  Written to {output_file}")
+            migrated_content = migrate_file(original_path, new_path, notes, original_content)
 
-        passed = run_checks(output_file)
-        status = "PASS (dry-run, real checks pending)" if passed else "FAIL"
-        results.append({"file": original_path, "new_path": new_path, "status": status})
+            output_file = OUTPUT_PATH / new_path
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.write_text(migrated_content, encoding="utf-8")
+
+            passed = run_checks(output_file)
+            status = "pass" if passed else "fail"
+
+        except Exception as e:
+            status = "error"
+            yield {"type": "file_error", "file": original_path, "message": f"{type(e).__name__}: {e}"}
+
+        result = {"file": original_path, "new_path": new_path, "status": status}
+        results.append(result)
+        yield {"type": "file_complete", **result}
+
+    yield {"type": "execution_complete", "results": results}
+
+
+def execute_plan():
+    """CLI-friendly wrapper — consumes the stream, prints progress, returns results."""
+    results = []
+    for event in execute_plan_stream():
+        if event["type"] == "file_start":
+            print(f"\nMigrating: {event['file']} -> {event['new_path']}")
+        elif event["type"] == "file_complete":
+            print(f"  Status: {event['status'].upper()}")
+        elif event["type"] == "file_error":
+            print(f"  ERROR: {event['message']}")
+        elif event["type"] == "error":
+            print(f"FATAL: {event['message']}")
+        elif event["type"] == "execution_complete":
+            results = event["results"]
 
     print("\n" + "=" * 60)
     print("MIGRATION SUMMARY")
     print("=" * 60)
     for r in results:
-        print(f"  [{r['status']}]  {r['file']} -> {r['new_path']}")
-
+        print(f"  [{r['status'].upper()}]  {r['file']} -> {r['new_path']}")
     return results
 
 
