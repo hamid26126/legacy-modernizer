@@ -3,7 +3,9 @@ import json
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
+from sandbox_verify import build_base_checkpoint, write_all_files, run_build, guess_broken_file
 
+MAX_VERIFY_RETRIES = 2
 load_dotenv()
 
 client = OpenAI(
@@ -76,11 +78,38 @@ def run_checks(file_path: Path) -> bool:
     return True
 
 
+
+
+
+def fix_file_with_build_error(original_path, new_path, current_content, notes, build_error):
+    """Feed the real sandbox build error back to Super and ask for a corrected version."""
+    system_msg = (
+        "You are fixing a React file that failed a real build. You will get the "
+        "current file content, the original migration notes, and the exact build "
+        "error output. Fix ONLY what's needed to make the build pass — do not "
+        "rewrite unrelated parts. Respond with ONLY the corrected file content, "
+        "no markdown fences, no commentary."
+    )
+    user_msg = (
+        f"FILE: {new_path} (migrated from {original_path})\n\n"
+        f"ORIGINAL MIGRATION NOTES:\n{notes}\n\n"
+        f"CURRENT CONTENT:\n{current_content}\n\n"
+        f"BUILD ERROR:\n{build_error}\n\n"
+        "Produce the corrected file content now."
+    )
+    response = client.chat.completions.create(
+        model=SUPER_MODEL,
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+        temperature=0.2,
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+    return raw
+
+
 def execute_plan_stream():
-    """
-    Generator version — yields progress events per file. Final event is
-    {"type": "execution_complete", "results": [...]}.
-    """
     try:
         plan = load_plan()
     except Exception as e:
@@ -89,53 +118,100 @@ def execute_plan_stream():
 
     files = sorted(plan["files"], key=lambda f: f["priority"])
     OUTPUT_PATH.mkdir(exist_ok=True)
-    results = []
 
+    migrated = {}   # new_path -> content
+    file_meta = {}  # new_path -> {"original_path", "notes"}
+
+    # Phase 1: generate each file with Super (as before)
     for entry in files:
         original_path = entry["path"]
         new_path = entry["new_path"]
         notes = entry["migration_notes"]
+        file_meta[new_path] = {"original_path": original_path, "notes": notes}
 
         yield {"type": "file_start", "file": original_path, "new_path": new_path}
-
         try:
-            original_full_path = REPO_PATH / original_path
-            original_content = original_full_path.read_text(encoding="utf-8")
-
-            migrated_content = migrate_file(original_path, new_path, notes, original_content)
-
+            original_content = (REPO_PATH / original_path).read_text(encoding="utf-8")
+            content = migrate_file(original_path, new_path, notes, original_content)
+            migrated[new_path] = content
             output_file = OUTPUT_PATH / new_path
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            output_file.write_text(migrated_content, encoding="utf-8")
-
-            passed = run_checks(output_file)
-            status = "pass" if passed else "fail"
-
+            output_file.write_text(content, encoding="utf-8")
+            yield {"type": "file_generated", "file": original_path, "new_path": new_path}
         except Exception as e:
-            status = "error"
             yield {"type": "file_error", "file": original_path, "message": f"{type(e).__name__}: {e}"}
 
-        result = {"file": original_path, "new_path": new_path, "status": status}
-        results.append(result)
-        yield {"type": "file_complete", **result}
+    # Phase 2: verify the WHOLE app in a real sandbox build, with self-correction retries
+    yield {"type": "verify_start", "attempt": 1}
+    try:
+        base_cp = build_base_checkpoint()
+    except Exception as e:
+        yield {"type": "error", "message": f"Sandbox setup failed: {type(e).__name__}: {e}"}
+        results = [{"file": m["original_path"], "new_path": p, "status": "unverified"} for p, m in file_meta.items()]
+        yield {"type": "execution_complete", "results": results}
+        return
 
-    yield {"type": "execution_complete", "results": results}
+    attempt = 1
+    passed = False
+    build_output = ""
+    while attempt <= MAX_VERIFY_RETRIES + 1:
+        cp = write_all_files(base_cp, migrated)
+        passed, build_output = run_build(cp)
+        yield {"type": "verify_result", "attempt": attempt, "passed": passed, "output": build_output[-1500:]}
+
+        if passed or attempt > MAX_VERIFY_RETRIES:
+            break
+
+        broken = guess_broken_file(build_output, list(migrated.keys()))
+        if not broken:
+            yield {"type": "info", "message": "Could not identify which file caused the failure — stopping retries."}
+            break
+
+        meta = file_meta[broken]
+        yield {"type": "file_fixing", "new_path": broken, "attempt": attempt + 1}
+        try:
+            fixed = fix_file_with_build_error(meta["original_path"], broken, migrated[broken], meta["notes"], build_output)
+            migrated[broken] = fixed
+            (OUTPUT_PATH / broken).write_text(fixed, encoding="utf-8")
+            yield {"type": "file_fixed", "new_path": broken, "attempt": attempt + 1}
+        except Exception as e:
+            yield {"type": "file_error", "file": broken, "message": f"{type(e).__name__}: {e}"}
+            break
+        attempt += 1
+
+    final_status = "pass" if passed else "fail"
+    results = []
+    for new_path, meta in file_meta.items():
+        results.append({"file": meta["original_path"], "new_path": new_path, "status": final_status})
+        yield {"type": "file_complete", "file": meta["original_path"], "new_path": new_path, "status": final_status}
+
+    yield {"type": "execution_complete", "results": results, "verified": passed, "attempts": attempt}
 
 
 def execute_plan():
-    """CLI-friendly wrapper — consumes the stream, prints progress, returns results."""
+    """CLI wrapper — prints progress as the stream comes in."""
     results = []
     for event in execute_plan_stream():
-        if event["type"] == "file_start":
-            print(f"\nMigrating: {event['file']} -> {event['new_path']}")
-        elif event["type"] == "file_complete":
-            print(f"  Status: {event['status'].upper()}")
-        elif event["type"] == "file_error":
+        t = event["type"]
+        if t == "file_start":
+            print(f"\nGenerating: {event['file']} -> {event['new_path']}")
+        elif t == "file_generated":
+            print("  Generated.")
+        elif t == "verify_start":
+            print("\nSetting up sandbox and verifying full build...")
+        elif t == "verify_result":
+            print(f"  Attempt {event['attempt']}: {'PASS' if event['passed'] else 'FAIL'}")
+            if not event["passed"]:
+                print(f"  Build output (tail):\n{event['output']}")
+        elif t == "file_fixing":
+            print(f"  Fixing {event['new_path']} (attempt {event['attempt']})...")
+        elif t == "file_fixed":
+            print(f"  Fix applied to {event['new_path']}.")
+        elif t in ("error", "file_error"):
             print(f"  ERROR: {event['message']}")
-        elif event["type"] == "error":
-            print(f"FATAL: {event['message']}")
-        elif event["type"] == "execution_complete":
+        elif t == "execution_complete":
             results = event["results"]
+            print(f"\nFinal verified: {event['verified']} (after {event['attempts']} attempt(s))")
 
     print("\n" + "=" * 60)
     print("MIGRATION SUMMARY")

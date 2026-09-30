@@ -1,44 +1,11 @@
 import React, { useState, useEffect } from 'react';
 
-function TaskInput({ onAdd }) {
-  const [value, setValue] = useState('');
-
-  const handleAddClick = () => {
-    const trimmed = value.trim();
-    if (trimmed) {
-      onAdd(trimmed);
-      setValue('');
-    }
-  };
-
+function TaskInput({ value, onChange, onAddClick }) {
   return (
     <>
-      <input
-        type="text"
-        id="task-input"
-        value={value}
-        onChange={e => setValue(e.target.value)}
-        placeholder="Enter a task"
-      />
-      <button id="add-btn" onClick={handleAddClick}>
-        Add Task
-      </button>
+      <input id="task-input" type="text" value={value} onChange={onChange} />
+      <button id="add-btn" onClick={onAddClick}>Add Task</button>
     </>
-  );
-}
-
-function TaskList({ tasks, onDelete, onToggle }) {
-  return (
-    <ul id="task-list">
-      {tasks.map(task => (
-        <TaskItem
-          key={task.id}
-          task={task}
-          onDelete={onDelete}
-          onToggle={onToggle}
-        />
-      ))}
-    </ul>
   );
 }
 
@@ -59,52 +26,74 @@ function TaskItem({ task, onDelete, onToggle }) {
   );
 }
 
+function TaskList({ tasks, onDelete, onToggle }) {
+  return (
+    <ul id="task-list">
+      {tasks.map(task => (
+        <TaskItem
+          key={task.id}
+          task={task}
+          onDelete={onDelete}
+          onToggle={onToggle}
+        />
+      ))}
+    </ul>
+  );
+}
+
 function Stats({ tasks }) {
   const total = tasks.length;
   const completed = tasks.filter(t => t.completed).length;
   const remaining = total - completed;
-  const text = `Total: ${total} | Completed: ${completed} | Remaining: ${remaining}`;
-  return <div id="stats">{text}</div>;
+  return (
+    <div id="stats">
+      Total: {total} | Completed: {completed} | Remaining: {remaining}
+    </div>
+  );
 }
 
-function Controls({ showCompletedOnly, onToggleShowCompleted, onClearCompleted }) {
+function Controls({ showCompletedOnly, onToggleShow, onClearCompleted }) {
   return (
-    <div>
-      <button id="toggle-completed" onClick={onToggleShowCompleted}>
+    <>
+      <button id="toggle-completed" onClick={onToggleShow}>
         {showCompletedOnly ? 'Show all' : 'Show completed only'}
       </button>
       <button id="clear-completed" onClick={onClearCompleted}>
         Clear Completed
       </button>
-    </div>
+    </>
   );
 }
 
 function App() {
   const [tasks, setTasks] = useState([]);
   const [showCompletedOnly, setShowCompletedOnly] = useState(false);
+  const [inputValue, setInputValue] = useState('');
 
   useEffect(() => {
     fetch('https://jsonplaceholder.typicode.com/todos?_limit=3')
       .then(res => res.json())
       .then(data => {
-        const mapped = data.map(item => ({
+        const initialTasks = data.map(item => ({
           id: item.id,
           title: item.title,
           completed: item.completed
         }));
-        setTasks(mapped);
+        setTasks(initialTasks);
       })
       .catch(console.error);
   }, []);
 
-  const handleAdd = title => {
+  const handleAdd = () => {
+    const val = inputValue.trim();
+    if (val === '') return;
     const newTask = {
       id: 'local-' + Date.now(),
-      title: title,
+      title: val,
       completed: false
     };
     setTasks(prev => [...prev, newTask]);
+    setInputValue('');
   };
 
   const handleDelete = id => {
@@ -133,12 +122,20 @@ function App() {
 
   return (
     <div>
-      <TaskInput onAdd={handleAdd} />
-      <TaskList tasks={visibleTasks} onDelete={handleDelete} onToggle={handleToggle} />
+      <TaskInput
+        value={inputValue}
+        onChange={e => setInputValue(e.target.value)}
+        onAddClick={handleAdd}
+      />
+      <TaskList
+        tasks={visibleTasks}
+        onDelete={handleDelete}
+        onToggle={handleToggle}
+      />
       <Stats tasks={tasks} />
       <Controls
         showCompletedOnly={showCompletedOnly}
-        onToggleShowCompleted={handleToggleShow}
+        onToggleShow={handleToggleShow}
         onClearCompleted={handleClearCompleted}
       />
     </div>
