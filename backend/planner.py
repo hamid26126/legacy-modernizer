@@ -4,6 +4,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 from tavily import TavilyClient
+from utils import call_with_retry, normalize_plan
+
+import sys
+sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()
 
@@ -46,6 +50,11 @@ def build_prompt(repo_content: str, tavily_context: str) -> list:
         "You are a senior software architect planning a migration of a jQuery "
         "codebase to React. You will be given the full source of a small jQuery "
         "project and some current migration reference material. "
+        "IMPORTANT CONSTRAINT: Each entry in the plan must correspond to exactly ONE "
+        "original file producing exactly ONE new file. Do NOT propose splitting a single "
+        "original file into multiple new component files, even if that would normally be "
+        "good React practice — the execution pipeline processes one new file per plan "
+        "entry and cannot coordinate imports across newly-split files. "
         "Respond with ONLY valid JSON, no markdown fences, no commentary before or after. "
         "The JSON schema must be exactly:\n"
         "{\n"
@@ -102,13 +111,16 @@ def get_migration_plan_stream(force_refresh: bool = False):
 
         yield {"type": "progress", "step": "planning", "message": "Calling Nemotron 3 Ultra for the migration plan (this costs credits)..."}
         messages = build_prompt(repo_content, tavily_context)
-        response = client.chat.completions.create(
+        response = call_with_retry(
+            client.chat.completions.create,
             model=ULTRA_MODEL,
             messages=messages,
             temperature=0.2,
+            max_tokens=4000,
         )
         raw = response.choices[0].message.content
         plan = parse_json_response(raw)
+        plan = normalize_plan(plan)
 
         PLAN_CACHE.write_text(json.dumps(plan, indent=2))
         yield {"type": "info", "message": f"Plan saved to {PLAN_CACHE}"}

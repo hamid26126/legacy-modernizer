@@ -1,31 +1,32 @@
 {
   "files": [
     {
-      "path": "index.html",
-      "new_path": "index.html",
-      "priority": 1,
-      "depends_on": [
-        "style.css"
-      ],
-      "migration_notes": "Convert static HTML to Vite entry point. Replace jQuery script tag with React root div (e.g., <div id=\"root\"></div>) and module script type. Move inline scripts to React components. Update asset references to Vite public path (e.g., /logo.png). Ensure environment variables use VITE_ prefix."
-    },
-    {
       "path": "style.css",
       "new_path": "src/index.css",
-      "priority": 2,
+      "priority": 1,
       "depends_on": [],
-      "migration_notes": "Global styles can be imported in main.jsx. Consider CSS Modules for component-scoped styles (e.g., TaskItem.module.css). Keep existing classes but avoid global selectors; use className in JSX. Remove box-sizing typo (border-box -> border-box)."
+      "migration_notes": "Global stylesheet. Keep as-is but import into React entry point. No jQuery-specific patterns; only standard CSS. Ensure class names (e.g., .completed, .task-text) match those used in React component."
     },
     {
       "path": "app.js",
       "new_path": "src/App.jsx",
-      "priority": 3,
+      "priority": 2,
       "depends_on": [
         "index.html",
         "style.css"
       ],
-      "migration_notes": "Major jQuery patterns to convert:\n1. $(document).ready -> useEffect with empty deps or component mount.\n2. Global selectors ($('#task-list'), $('#stats')) -> React state and refs.\n3. DOM manipulation (append, remove, toggleClass, hide/show) -> declarative rendering via state arrays.\n4. Event delegation ($('#task-list').on('click', '.delete-btn')) -> onClick handlers on each TaskItem.\n5. Checkbox change -> controlled component with onChange updating task completion.\n6. Filter toggle (showingCompletedOnly) -> state filter and derived visibleTasks.\n7. AJAX load -> useEffect with fetch, set initial tasks state.\n8. Data attributes (li.data('taskId')) -> task objects with id property.\n9. updateStats -> computed from tasks state.\n10. $.trim -> String.trim().\nStructure: Single App component with state { tasks: [], showCompletedOnly: false }. Sub-components: TaskInput, TaskList, TaskItem, Stats, Controls. Use functional components and hooks."
+      "migration_notes": "Convert entire jQuery logic to a single React component (App) with useState for tasks array and showingCompletedOnly flag. Replace DOM manipulation with state updates. Replace $.ajax with fetch in useEffect for initial data load. Event handlers become inline functions updating state. Derive stats from tasks state. Render task list via map. Import styles.css. Also include ReactDOM.createRoot render call in same file (entry point)."
+    },
+    {
+      "path": "index.html",
+      "new_path": "index.html",
+      "priority": 3,
+      "depends_on": [
+        "app.js",
+        "style.css"
+      ],
+      "migration_notes": "Update to Vite-compatible HTML: remove jQuery script tag, add <div id=\"root\"></div> for React mount, change script to type=\"module\" src=\"/src/main.jsx\". Adjust asset paths (no PUBLIC_URL). Keep CSS link but update href to \"/src/styles.css\" (or import via JS)."
     }
   ],
-  "overall_notes": "Migration strategy: Set up Vite React project, migrate HTML to entry point, move CSS to src, rewrite app.js as React component with hooks. Risks: jQuery's imperative DOM mutations vs React's declarative rendering; ensure state updates trigger re-renders correctly. Event delegation replaced by per-item handlers. AJAX migration to fetch with error handling. Global variable showingCompletedOnly becomes component state. Use Vite environment variables (VITE_) if needed. Test each feature incrementally. Consider TypeScript for better maintainability."
+  "overall_notes": "Migrate to Vite + React 18. Single-component approach due to one-to-one file constraint. Risks: all logic in one file may become unwieldy; state management must replace all jQuery DOM mutations. Ensure fetch error handling. CSS imported via JS to enable HMR. No code splitting allowed; future refactoring can extract components after migration."
 }

@@ -1,106 +1,43 @@
-import React, { useState, useEffect } from 'react';
-
-function TaskInput({ value, onChange, onAddClick }) {
-  return (
-    <>
-      <input id="task-input" type="text" value={value} onChange={onChange} />
-      <button id="add-btn" onClick={onAddClick}>Add Task</button>
-    </>
-  );
-}
-
-function TaskItem({ task, onDelete, onToggle }) {
-  return (
-    <li className={task.completed ? 'completed' : ''}>
-      <input
-        type="checkbox"
-        className="task-checkbox"
-        checked={task.completed}
-        onChange={() => onToggle(task.id)}
-      />
-      <span className="task-text">{task.title}</span>
-      <button className="delete-btn" onClick={() => onDelete(task.id)}>
-        Delete
-      </button>
-    </li>
-  );
-}
-
-function TaskList({ tasks, onDelete, onToggle }) {
-  return (
-    <ul id="task-list">
-      {tasks.map(task => (
-        <TaskItem
-          key={task.id}
-          task={task}
-          onDelete={onDelete}
-          onToggle={onToggle}
-        />
-      ))}
-    </ul>
-  );
-}
-
-function Stats({ tasks }) {
-  const total = tasks.length;
-  const completed = tasks.filter(t => t.completed).length;
-  const remaining = total - completed;
-  return (
-    <div id="stats">
-      Total: {total} | Completed: {completed} | Remaining: {remaining}
-    </div>
-  );
-}
-
-function Controls({ showCompletedOnly, onToggleShow, onClearCompleted }) {
-  return (
-    <>
-      <button id="toggle-completed" onClick={onToggleShow}>
-        {showCompletedOnly ? 'Show all' : 'Show completed only'}
-      </button>
-      <button id="clear-completed" onClick={onClearCompleted}>
-        Clear Completed
-      </button>
-    </>
-  );
-}
+import React, { useState, useEffect, useRef } from 'react';
+import ReactDOM from 'react-dom';
 
 function App() {
   const [tasks, setTasks] = useState([]);
-  const [showCompletedOnly, setShowCompletedOnly] = useState(false);
-  const [inputValue, setInputValue] = useState('');
+  const [showingCompletedOnly, setShowingCompletedOnly] = useState(false);
+  const inputRef = useRef();
+
+  const filteredTasks = showingCompletedOnly
+    ? tasks.filter(t => t.completed)
+    : tasks;
+
+  const total = tasks.length;
+  const completed = tasks.filter(t => t.completed).length;
+  const remaining = total - completed;
+  const statsText = `Total: ${total} | Completed: ${completed} | Remaining: ${remaining}`;
 
   useEffect(() => {
     fetch('https://jsonplaceholder.typicode.com/todos?_limit=3')
       .then(res => res.json())
       .then(data => {
-        const initialTasks = data.map(item => ({
-          id: item.id,
-          title: item.title,
-          completed: item.completed
-        }));
-        setTasks(initialTasks);
-      })
-      .catch(console.error);
+        setTasks(
+          data.map(item => ({
+            id: String(item.id),
+            title: item.title,
+            completed: item.completed,
+          }))
+        );
+      });
   }, []);
 
-  const handleAdd = () => {
-    const val = inputValue.trim();
+  const handleAddClick = () => {
+    const val = inputRef.current.value.trim();
     if (val === '') return;
-    const newTask = {
-      id: 'local-' + Date.now(),
-      title: val,
-      completed: false
-    };
-    setTasks(prev => [...prev, newTask]);
-    setInputValue('');
+    const taskId = 'local-' + Date.now();
+    setTasks(prev => [...prev, { id: taskId, title: val, completed: false }]);
+    inputRef.current.value = '';
   };
 
-  const handleDelete = id => {
-    setTasks(prev => prev.filter(t => t.id !== id));
-  };
-
-  const handleToggle = id => {
+  const toggleComplete = id => {
     setTasks(prev =>
       prev.map(t =>
         t.id === id ? { ...t, completed: !t.completed } : t
@@ -108,38 +45,54 @@ function App() {
     );
   };
 
-  const handleToggleShow = () => {
-    setShowCompletedOnly(prev => !prev);
+  const deleteTask = id => {
+    setTasks(prev => prev.filter(t => t.id !== id));
   };
 
-  const handleClearCompleted = () => {
+  const clearCompleted = () => {
     setTasks(prev => prev.filter(t => !t.completed));
   };
 
-  const visibleTasks = showCompletedOnly
-    ? tasks.filter(t => t.completed)
-    : tasks;
+  const toggleShowCompleted = () => {
+    setShowingCompletedOnly(!showingCompletedOnly);
+  };
 
   return (
     <div>
-      <TaskInput
-        value={inputValue}
-        onChange={e => setInputValue(e.target.value)}
-        onAddClick={handleAdd}
-      />
-      <TaskList
-        tasks={visibleTasks}
-        onDelete={handleDelete}
-        onToggle={handleToggle}
-      />
-      <Stats tasks={tasks} />
-      <Controls
-        showCompletedOnly={showCompletedOnly}
-        onToggleShow={handleToggleShow}
-        onClearCompleted={handleClearCompleted}
-      />
+      <input id="task-input" type="text" ref={inputRef} />
+      <button id="add-btn" onClick={handleAddClick}>
+        Add
+      </button>
+      <button id="toggle-completed" onClick={toggleShowCompleted}>
+        {showingCompletedOnly ? 'Show all' : 'Show completed only'}
+      </button>
+      <button id="clear-completed" onClick={clearCompleted}>
+        Clear Completed
+      </button>
+      <ul id="task-list">
+        {filteredTasks.map(task => (
+          <li
+            key={task.id}
+            className={task.completed ? 'completed' : ''}
+            data-task-id={task.id}
+          >
+            <input
+              type="checkbox"
+              className="task-checkbox"
+              checked={task.completed}
+              onChange={() => toggleComplete(task.id)}
+            />
+            <span className="task-text">{task.title}</span>
+            <button className="delete-btn" onClick={() => deleteTask(task.id)}>
+              Delete
+            </button>
+          </li>
+        ))}
+      </ul>
+      <div id="stats">{statsText}</div>
     </div>
   );
 }
 
-export default App;
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);

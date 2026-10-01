@@ -70,9 +70,23 @@ def run_build(checkpoint):
 
 
 def guess_broken_file(build_output: str, file_paths: list) -> str | None:
-    """Best-effort: check which migrated file's name appears in the build error."""
     for path in file_paths:
         filename = path.split("/")[-1]
         if filename in build_output:
             return path
-    return None
+    # No exact filename matched the error text — default to the first JS/JSX
+    # file rather than giving up, since most real build errors live there.
+    js_files = [p for p in file_paths if p.endswith((".jsx", ".js", ".tsx", ".ts"))]
+    return js_files[0] if js_files else (file_paths[0] if file_paths else None)
+
+
+def classify_build_error(build_output: str) -> str:
+    """Returns 'missing_dependency' if the build failed due to an unresolvable
+    npm package import, 'index_html' if it's an entry-point resolution issue,
+    or 'general' otherwise. Used to give the fixer model more targeted context."""
+    lowered = build_output.lower()
+    if "failed to resolve import" in lowered or "could not resolve" in lowered or "cannot find module" in lowered:
+        if "/src/main" in lowered or "index.html" in lowered:
+            return "index_html"
+        return "missing_dependency"
+    return "general"

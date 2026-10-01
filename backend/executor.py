@@ -1,9 +1,14 @@
 import os
+import re
 import json
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
-from sandbox_verify import build_base_checkpoint, write_all_files, run_build, guess_broken_file
+from sandbox_verify import build_base_checkpoint, write_all_files, run_build, guess_broken_file, classify_build_error
+from utils import call_with_retry, normalize_plan
+
+import sys
+sys.stdout.reconfigure(encoding="utf-8")
 
 MAX_VERIFY_RETRIES = 2
 load_dotenv()
@@ -19,10 +24,33 @@ OUTPUT_PATH = Path(__file__).parent.parent / "output"
 PLAN_CACHE = Path(__file__).parent / "plan_cache.json"
 
 
+def build_fixed_index_html(original_html: str) -> str:
+    """
+    index.html is NOT sent to the LLM. Its entry script must exactly match our
+    sandbox scaffold (src/main.jsx) — letting the model regenerate this file
+    was causing non-deterministic build failures from guessed entry paths.
+    We build it from a fixed template and just preserve the original title.
+    """
+    match = re.search(r"<title>(.*?)</title>", original_html, re.IGNORECASE | re.DOTALL)
+    title = match.group(1).strip() if match else "App"
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{title}</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+"""
+
 def load_plan() -> dict:
     if not PLAN_CACHE.exists():
         raise FileNotFoundError("No plan_cache.json found. Run planner.py first.")
-    return json.loads(PLAN_CACHE.read_text())
+    return normalize_plan(json.loads(PLAN_CACHE.read_text()))
 
 
 def migrate_file(original_path: str, new_path: str, migration_notes: str, original_content: str) -> str:
@@ -37,6 +65,12 @@ def migrate_file(original_path: str, new_path: str, migration_notes: str, origin
     "names — if you rename or drop them, the styling will break even though the "
     "app still functions. Also preserve original visible text (button labels, "
     "headings) exactly unless the migration notes explicitly say to change them. "
+    "IMPORTANT CONSTRAINT: Do not import or rely on any npm package other than "
+    "'react' and 'react-dom', which are the only dependencies available in the target "
+    "environment. If the original code uses a jQuery plugin or utility library (e.g. a "
+    "datepicker, carousel, animation library, lodash, moment.js), reimplement the "
+    "equivalent behavior using only plain JavaScript and React — do not import a "
+    "replacement package. "
     "Respond with ONLY the final code for the new file — no markdown fences, "
     "no explanation, no commentary. Just the raw file content, ready to write to disk."
 )
@@ -54,6 +88,7 @@ def migrate_file(original_path: str, new_path: str, migration_notes: str, origin
             {"role": "user", "content": user_msg},
         ],
         temperature=0.2,
+        max_tokens=4000,
     )
     raw = response.choices[0].message.content.strip()
 
@@ -87,7 +122,12 @@ def fix_file_with_build_error(original_path, new_path, current_content, notes, b
         "You are fixing a React file that failed a real build. You will get the "
         "current file content, the original migration notes, and the exact build "
         "error output. Fix ONLY what's needed to make the build pass — do not "
-        "rewrite unrelated parts. Respond with ONLY the corrected file content, "
+        "rewrite unrelated parts. "
+        "IMPORTANT CONSTRAINT: Do not introduce any import from an npm package other "
+        "than 'react' and 'react-dom' — none are available besides those. If the build "
+        "error is about a package that cannot be resolved, rewrite that code to not "
+        "depend on any external package at all. "
+        "Respond with ONLY the corrected file content, "
         "no markdown fences, no commentary."
     )
     user_msg = (
@@ -101,6 +141,7 @@ def fix_file_with_build_error(original_path, new_path, current_content, notes, b
         model=SUPER_MODEL,
         messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
         temperature=0.2,
+        max_tokens=4000,
     )
     raw = response.choices[0].message.content.strip()
     if raw.startswith("```"):
@@ -119,10 +160,10 @@ def execute_plan_stream():
     files = sorted(plan["files"], key=lambda f: f["priority"])
     OUTPUT_PATH.mkdir(exist_ok=True)
 
-    migrated = {}   # new_path -> content
-    file_meta = {}  # new_path -> {"original_path", "notes"}
+    migrated = {}
+    file_meta = {}
+    generation_failed = False
 
-    # Phase 1: generate each file with Super (as before)
     for entry in files:
         original_path = entry["path"]
         new_path = entry["new_path"]
@@ -132,14 +173,26 @@ def execute_plan_stream():
         yield {"type": "file_start", "file": original_path, "new_path": new_path}
         try:
             original_content = (REPO_PATH / original_path).read_text(encoding="utf-8")
-            content = migrate_file(original_path, new_path, notes, original_content)
+
+            if entry["path"].lower().endswith(".html"):
+                content = build_fixed_index_html(original_content)
+            else:
+                content = call_with_retry(migrate_file, original_path, new_path, notes, original_content)
+
             migrated[new_path] = content
             output_file = OUTPUT_PATH / new_path
             output_file.parent.mkdir(parents=True, exist_ok=True)
             output_file.write_text(content, encoding="utf-8")
             yield {"type": "file_generated", "file": original_path, "new_path": new_path}
         except Exception as e:
+            generation_failed = True
             yield {"type": "file_error", "file": original_path, "message": f"{type(e).__name__}: {e}"}
+
+    if generation_failed:
+        yield {"type": "error", "message": "One or more files failed to generate — skipping build verification. Please try again."}
+        results = [{"file": m["original_path"], "new_path": p, "status": "generation_failed"} for p, m in file_meta.items()]
+        yield {"type": "execution_complete", "results": results, "verified": False, "attempts": 0}
+        return
 
     # Phase 2: verify the WHOLE app in a real sandbox build, with self-correction retries
     yield {"type": "verify_start", "attempt": 1}
@@ -170,7 +223,13 @@ def execute_plan_stream():
         meta = file_meta[broken]
         yield {"type": "file_fixing", "new_path": broken, "attempt": attempt + 1}
         try:
-            fixed = fix_file_with_build_error(meta["original_path"], broken, migrated[broken], meta["notes"], build_output)
+            error_category = classify_build_error(build_output)
+            if error_category == "missing_dependency":
+                build_output_for_fix = build_output + "\n\nNOTE: This error is almost certainly caused by importing an npm package that isn't available. Rewrite this file to avoid importing any package other than react/react-dom."
+            else:
+                build_output_for_fix = build_output
+
+            fixed = call_with_retry(fix_file_with_build_error, meta["original_path"], broken, migrated[broken], meta["notes"], build_output_for_fix)
             migrated[broken] = fixed
             (OUTPUT_PATH / broken).write_text(fixed, encoding="utf-8")
             yield {"type": "file_fixed", "new_path": broken, "attempt": attempt + 1}
