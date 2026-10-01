@@ -127,6 +127,9 @@ def fix_file_with_build_error(original_path, new_path, current_content, notes, b
         "than 'react' and 'react-dom' — none are available besides those. If the build "
         "error is about a package that cannot be resolved, rewrite that code to not "
         "depend on any external package at all. "
+        "CRITICAL: If this file contains 'export default', you MUST keep that default "
+        "export in your corrected version — never remove it, even while fixing an "
+        "unrelated issue. "
         "Respond with ONLY the corrected file content, "
         "no markdown fences, no commentary."
     )

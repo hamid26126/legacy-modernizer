@@ -38,7 +38,7 @@ def read_repo(repo_path: Path) -> str:
 
 def ground_with_tavily(query: str) -> str:
     """Pull current migration guidance so the plan isn't based on stale training data."""
-    results = tavily.search(query, max_results=3, search_depth="basic")
+    results = call_with_retry(tavily.search, query, max_results=3, search_depth="basic")
     snippets = []
     for r in results.get("results", []):
         snippets.append(f"Source: {r['url']}\n{r['content'][:500]}")
