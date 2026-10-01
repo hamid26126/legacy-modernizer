@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
-from sandbox_verify import build_base_checkpoint, write_all_files, run_build, guess_broken_file, classify_build_error
+from sandbox_verify import build_base_checkpoint, write_all_files, run_full_verification, guess_broken_file, classify_build_error
 from utils import call_with_retry, normalize_plan
 
 import sys
@@ -216,8 +216,11 @@ def execute_plan_stream():
     build_output = ""
     while attempt <= MAX_VERIFY_RETRIES + 1:
         cp = write_all_files(base_cp, migrated)
-        passed, build_output = run_build(cp)
-        yield {"type": "verify_result", "attempt": attempt, "passed": passed, "output": build_output[-1500:]}
+        verify_result = run_full_verification(cp)
+        passed = verify_result["passed"]
+        build_output = verify_result["output"]
+        stage = verify_result["stage"]
+        yield {"type": "verify_result", "attempt": attempt, "passed": passed, "stage": stage, "output": build_output[-1500:]}
 
         if passed or attempt > MAX_VERIFY_RETRIES:
             break
@@ -266,7 +269,8 @@ def execute_plan():
         elif t == "verify_start":
             print("\nSetting up sandbox and verifying full build...")
         elif t == "verify_result":
-            print(f"  Attempt {event['attempt']}: {'PASS' if event['passed'] else 'FAIL'}")
+            stage_label = f" [{event.get('stage')}]" if event.get("stage") else ""
+            print(f"  Attempt {event['attempt']}:{stage_label} {'PASS' if event['passed'] else 'FAIL'}")
             if not event["passed"]:
                 print(f"  Build output (tail):\n{event['output']}")
         elif t == "file_fixing":

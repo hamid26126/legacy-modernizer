@@ -15,9 +15,18 @@ BASE_PACKAGE_JSON = json.dumps({
     "private": True,
     "version": "0.0.0",
     "type": "module",
-    "scripts": {"build": "vite build"},
+    "scripts": {
+        "build": "vite build",
+        "lint": "eslint src --ext js,jsx || true"
+    },
     "dependencies": {"react": "^18.2.0", "react-dom": "^18.2.0"},
-    "devDependencies": {"@vitejs/plugin-react": "^4.2.0", "vite": "^5.0.0"},
+    "devDependencies": {
+        "@vitejs/plugin-react": "^4.2.0",
+        "vite": "^5.0.0",
+        "eslint": "^8.57.0",
+        "eslint-plugin-react": "^7.34.0",
+        "eslint-plugin-react-hooks": "^4.6.0"
+    },
 }, indent=2)
 
 BASE_VITE_CONFIG = """import { defineConfig } from 'vite'
@@ -37,6 +46,20 @@ ReactDOM.createRoot(document.getElementById('root')).render(
 )
 """
 
+BASE_ESLINTRC = """module.exports = {
+  root: true,
+  env: { browser: true, es2021: true },
+  extends: ['eslint:recommended', 'plugin:react/recommended', 'plugin:react-hooks/recommended'],
+  parserOptions: { ecmaVersion: 'latest', sourceType: 'module', ecmaFeatures: { jsx: true } },
+  settings: { react: { version: 'detect' } },
+  rules: {
+    'react/react-in-jsx-scope': 'off',
+    'react/prop-types': 'off',
+    'no-unused-vars': 'warn'
+  }
+}
+"""
+
 
 def write_file(checkpoint, remote_path: str, content: str):
     """Write a file into the sandbox via base64 — safe regardless of content/quoting."""
@@ -51,6 +74,7 @@ def build_base_checkpoint():
     cp = write_file(image, "/app/package.json", BASE_PACKAGE_JSON)
     cp = write_file(cp, "/app/vite.config.js", BASE_VITE_CONFIG)
     cp = write_file(cp, "/app/src/main.jsx", BASE_MAIN_JSX)
+    cp = write_file(cp, "/app/.eslintrc.cjs", BASE_ESLINTRC)
     cp = call_with_retry(lambda: cp.run(shell="cd /app && npm install", disposable=False).wait())
     return cp
 
@@ -71,6 +95,35 @@ def run_build(checkpoint):
     return passed, output
 
 
+def run_lint(checkpoint):
+    """Run ESLint on the migrated JS/JSX files inside the sandbox. Returns
+    (passed: bool, combined_output: str). Only 'error' severity findings fail
+    verification — warnings are logged but don't block."""
+    result_cp = call_with_retry(lambda: checkpoint.run(shell="cd /app && npm run lint", disposable=False).wait())
+    output = (result_cp.result.stdout or "") + "\n" + (result_cp.result.stderr or "")
+    match = re.search(r"✖\s+.*?\((\d+)\s+errors?", output) or re.search(r"(\d+)\s+errors?\s*\(", output)
+    error_count = int(match.group(1)) if match else 0
+    passed = error_count == 0
+    return passed, output
+
+
+def run_full_verification(checkpoint):
+    """
+    Runs build, then (only if build passed) lint. Returns a dict:
+    {"passed": bool, "stage": "build" | "lint" | None, "output": str}
+    stage is None only when passed is True.
+    """
+    build_passed, build_output = run_build(checkpoint)
+    if not build_passed:
+        return {"passed": False, "stage": "build", "output": build_output}
+
+    lint_passed, lint_output = run_lint(checkpoint)
+    if not lint_passed:
+        return {"passed": False, "stage": "lint", "output": lint_output}
+
+    return {"passed": True, "stage": None, "output": build_output + "\n\n--- Lint ---\n" + lint_output}
+
+
 def guess_broken_file(build_output: str, file_paths: list) -> str | None:
     """
     Identify which migrated file actually caused a build failure. Prefers
@@ -82,9 +135,10 @@ def guess_broken_file(build_output: str, file_paths: list) -> str | None:
         r"file:\s*/app/([^\s:]+)",
         r'is not exported by ["\']([^"\']+)["\']',
         r'from ["\']([^"\']+)["\']',
+        r"^(/app/[^\s:]+)",
     ]
     for pattern in patterns:
-        m = re.search(pattern, build_output)
+        m = re.search(pattern, build_output, re.MULTILINE)
         if m:
             candidate = m.group(1)
             candidate_name = candidate.split("/")[-1]
