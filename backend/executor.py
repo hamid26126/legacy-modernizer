@@ -71,6 +71,10 @@ def migrate_file(original_path: str, new_path: str, migration_notes: str, origin
     "datepicker, carousel, animation library, lodash, moment.js), reimplement the "
     "equivalent behavior using only plain JavaScript and React — do not import a "
     "replacement package. "
+    "CRITICAL: This file must export its main component as the default export "
+    "(`export default ComponentName;`). Do NOT call createRoot, ReactDOM.render, or any "
+    "app-mounting code inside this file — the application's entry point (main.jsx) already "
+    "handles mounting and expects to import this file's default export. "
     "Respond with ONLY the final code for the new file — no markdown fences, "
     "no explanation, no commentary. Just the raw file content, ready to write to disk."
 )

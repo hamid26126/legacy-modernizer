@@ -1,31 +1,28 @@
 {
   "files": [
     {
-      "path": "style.css",
-      "new_path": "src/index.css",
+      "path": "app.js",
+      "new_path": "src/App.jsx",
       "priority": 1,
       "depends_on": [],
-      "migration_notes": "Global CSS with class/id selectors used by jQuery. Move to src/styles.css and import in App.jsx. No logic changes needed; keep all rules. Ensure class names (e.g., .completed, .task-text) match React component output."
+      "migration_notes": "Convert jQuery DOM manipulation to React state and hooks. Replace $(document).ready with useEffect for initial fetch. Use useState for tasks array, showingCompletedOnly flag. Replace appendTask with state update. Convert event delegation (.on) to inline handlers in JSX. Replace $.ajax with fetch in useEffect. Remove direct DOM queries (#task-list li) and use state-derived rendering. Implement toggle/complete/delete as state setters. Keep taskId generation logic. Import styles.css in this file.\n\nIMPORTANT: The migrated stylesheet is already imported globally by the app's entry point (main.jsx). Do NOT add any CSS import statement to this file yourself, and do not reference any CSS filename directly in this file.\n\nOVERRIDE \u2014 IGNORE ANY CONFLICTING INSTRUCTION ABOVE: Do NOT call createRoot, ReactDOM.render, or any app-mounting code anywhere in this file, even if an earlier note in this same message said to. This file must ONLY define the component and end with `export default ComponentName;` \u2014 nothing else. The actual mounting is handled entirely by a separate entry point file (main.jsx) that is not part of this migration and already exists."
+    },
+    {
+      "path": "style.css",
+      "new_path": "src/index.css",
+      "priority": 2,
+      "depends_on": [],
+      "migration_notes": "CSS can remain largely unchanged. Ensure class names match JSX output (e.g., .completed, .task-text, .delete-btn). No jQuery-specific selectors. Import this file in src/main.jsx via import './styles.css';"
     },
     {
       "path": "index.html",
       "new_path": "index.html",
-      "priority": 2,
-      "depends_on": [
-        "style.css"
-      ],
-      "migration_notes": "Replace jQuery script tags with React entry point. Remove <script src=\"https://code.jquery.com/jquery-3.7.1.min.js\"></script> and <script src=\"app.js\"></script>. Add <div id=\"root\"></div> as mount point. Link Vite entry script: <script type=\"module\" src=\"/src/main.jsx\"></script>. Keep CSS link updated to new path if needed (e.g., <link rel=\"stylesheet\" href=\"/src/styles.css\">)."
-    },
-    {
-      "path": "app.js",
-      "new_path": "src/App.jsx",
       "priority": 3,
       "depends_on": [
-        "index.html",
-        "style.css"
+        "app.js"
       ],
-      "migration_notes": "Convert entire jQuery logic to a single React functional component. Replace $(document).ready with useEffect([]). State: tasks[] (from AJAX), showingCompletedOnly (bool). Replace appendTask with TaskItem sub-component (defined in same file) mapping over tasks. Event handlers: onAddClick, onDelete, onToggleComplete, onFilterToggle, onClearCompleted become useState setters. AJAX -> useEffect fetch in useEffect with fetch. Update stats via derived values (tasks.length, filter). Toggle filter updates showingCompletedOnly and conditionally renders items. Clear completed filters tasks. All DOM manipulation replaced by JSX rendering. Import './styles.css' at top.\n\nIMPORTANT: The migrated stylesheet is already imported globally by the app's entry point (main.jsx). Do NOT add any CSS import statement to this file yourself, and do not reference any CSS filename directly in this file."
+      "migration_notes": "Transform into Vite-compatible template. Remove jQuery script tag and app.js script tag. Remove link to style.css (now imported in JS). Add root div <div id=\"root\"></div>. Add module script entry point: <script type=\"module\" src=\"/src/main.jsx\"></script>. Update title and meta tags as needed. Ensure no inline event handlers remain."
     }
   ],
-  "overall_notes": "Migration follows a bottom-up order: styles first, then HTML template, then main component. Risk: single-file constraint forces all React logic into App.jsx, including sub-components, which may become large but avoids cross-file import coordination. Use Vite conventions (no PUBLIC_URL, env vars with VITE_ prefix). Ensure main.jsx renders <App /> into #root. Test fetch against JSONPlaceholder API. No TypeScript; keep JSX in .jsx files."
+  "overall_notes": "Migration follows a single-component approach due to one-file-per-entry constraint. All logic consolidated into src/main.jsx with React hooks replacing jQuery state management. CSS imported directly into component. HTML becomes minimal Vite template. Risks: large single component may become unwieldy; consider future refactoring. AJAX call uses fetch with error handling. Initial data load via useEffect. No external dependencies beyond React/ReactDOM. Build with Vite (adjust env vars if needed)."
 }

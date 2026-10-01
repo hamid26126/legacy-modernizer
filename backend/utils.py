@@ -37,6 +37,12 @@ def normalize_plan(plan: dict) -> dict:
                 + "\n\nIMPORTANT: The migrated stylesheet is already imported globally by the "
                   "app's entry point (main.jsx). Do NOT add any CSS import statement to this file "
                   "yourself, and do not reference any CSS filename directly in this file."
+                + "\n\nOVERRIDE — IGNORE ANY CONFLICTING INSTRUCTION ABOVE: Do NOT call createRoot, "
+                  "ReactDOM.render, or any app-mounting code anywhere in this file, even if an earlier "
+                  "note in this same message said to. This file must ONLY define the component and "
+                  "end with `export default ComponentName;` — nothing else. The actual mounting is "
+                  "handled entirely by a separate entry point file (main.jsx) that is not part of this "
+                  "migration and already exists."
             )
 
     return plan
