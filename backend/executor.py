@@ -5,7 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 from sandbox_verify import build_base_checkpoint, write_all_files, run_full_verification, guess_broken_file, classify_build_error
-from utils import call_with_retry, normalize_plan
+from utils import call_with_retry, normalize_plan, get_plan_cache_path
 
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
@@ -19,9 +19,7 @@ client = OpenAI(
 )
 
 SUPER_MODEL = "nvidia/nemotron-3-super-120b-a12b"
-REPO_PATH = Path(__file__).parent.parent / "test-repos" / "sample-jquery-app"
 OUTPUT_PATH = Path(__file__).parent.parent / "output"
-PLAN_CACHE = Path(__file__).parent / "plan_cache.json"
 
 
 def build_fixed_index_html(original_html: str) -> str:
@@ -47,10 +45,11 @@ def build_fixed_index_html(original_html: str) -> str:
 </html>
 """
 
-def load_plan() -> dict:
-    if not PLAN_CACHE.exists():
-        raise FileNotFoundError("No plan_cache.json found. Run planner.py first.")
-    return normalize_plan(json.loads(PLAN_CACHE.read_text()))
+def load_plan(repo_path: Path, cache_key: str | None = None) -> dict:
+    plan_cache = get_plan_cache_path(repo_path, cache_key)
+    if not plan_cache.exists():
+        raise FileNotFoundError(f"No {plan_cache.name} found. Run planner.py first.")
+    return normalize_plan(json.loads(plan_cache.read_text()))
 
 
 def migrate_file(original_path: str, new_path: str, migration_notes: str, original_content: str) -> str:
@@ -92,9 +91,12 @@ def migrate_file(original_path: str, new_path: str, migration_notes: str, origin
             {"role": "user", "content": user_msg},
         ],
         temperature=0.2,
-        max_tokens=4000,
+        max_tokens=12000,
     )
-    raw = response.choices[0].message.content.strip()
+    content = response.choices[0].message.content
+    if content is None:
+        raise ValueError(f"Model returned empty content for {new_path} — likely hit a token/length limit.")
+    raw = content.strip()
 
     # Strip markdown fences if the model adds them anyway, despite instructions
     if raw.startswith("```"):
@@ -148,23 +150,26 @@ def fix_file_with_build_error(original_path, new_path, current_content, notes, b
         model=SUPER_MODEL,
         messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
         temperature=0.2,
-        max_tokens=4000,
+        max_tokens=12000,
     )
-    raw = response.choices[0].message.content.strip()
+    content = response.choices[0].message.content
+    if content is None:
+        raise ValueError(f"Model returned empty content for {new_path} — likely hit a token/length limit.")
+    raw = content.strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
         raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
     return raw
 
 
-def execute_plan_stream():
+def execute_plan_stream(repo_path: Path, cache_key: str | None = None):
     try:
-        plan = load_plan()
+        plan = load_plan(repo_path, cache_key)
     except Exception as e:
         yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
         return
 
-    files = sorted(plan["files"], key=lambda f: f["priority"])
+    files = sorted(plan["files"], key=lambda f: f.get("priority", 0))
     OUTPUT_PATH.mkdir(exist_ok=True)
 
     migrated = {}
@@ -178,8 +183,14 @@ def execute_plan_stream():
         file_meta[new_path] = {"original_path": original_path, "notes": notes}
 
         yield {"type": "file_start", "file": original_path, "new_path": new_path}
+        if "_unused_" in new_path:
+            output_file = OUTPUT_PATH / new_path
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.write_text(f"// Not migrated separately — see src/App.jsx\n", encoding="utf-8")
+            yield {"type": "file_generated", "file": original_path, "new_path": new_path}
+            continue
         try:
-            original_content = (REPO_PATH / original_path).read_text(encoding="utf-8")
+            original_content = (repo_path / original_path).read_text(encoding="utf-8")
 
             if entry["path"].lower().endswith(".html"):
                 content = build_fixed_index_html(original_content)
@@ -257,10 +268,10 @@ def execute_plan_stream():
     yield {"type": "execution_complete", "results": results, "verified": passed, "attempts": attempt}
 
 
-def execute_plan():
+def execute_plan(repo_path: Path, cache_key: str | None = None):
     """CLI wrapper — prints progress as the stream comes in."""
     results = []
-    for event in execute_plan_stream():
+    for event in execute_plan_stream(repo_path, cache_key):
         t = event["type"]
         if t == "file_start":
             print(f"\nGenerating: {event['file']} -> {event['new_path']}")
@@ -292,4 +303,6 @@ def execute_plan():
 
 
 if __name__ == "__main__":
-    execute_plan()
+    from pathlib import Path
+    default_path = Path(__file__).parent.parent / "test-repos" / "sample-jquery-app"
+    execute_plan(default_path)
