@@ -77,6 +77,12 @@ interface FinalSummary {
   attempts: number
 }
 
+/** Known-working example repo, pre-filled so a demo is always one click away. */
+const DEFAULT_REPO_URL = 'https://github.com/coryjquirk/weather-dashboard'
+
+/** Backend accepts only github.com hosts (repo_fetch.validate_github_url). */
+const REPO_URL_PREFIX = 'https://github.com/'
+
 const CARD_STATUS_CLASS: Record<FileStatus, string> = {
   pending: 'pending',
   generating: 'generating',
@@ -96,6 +102,7 @@ function App() {
   const [fileStatuses, setFileStatuses] = useState<Record<string, FileStatusEntry>>({})
   const [expandedCards, setExpandedCards] = useState<Record<number, boolean>>({})
   const [connectionError, setConnectionError] = useState(false)
+  const [repoUrl, setRepoUrl] = useState(DEFAULT_REPO_URL)
 
   // Verification timeline state
   const [timeline, setTimeline] = useState<TimelineEntry[]>([])
@@ -120,7 +127,11 @@ function App() {
 
   // ── Stage 1: Idle ──────────────────────────────────────────────────────
 
-  const handleStartPlanning = useCallback(() => {
+  const handleStartPlanning = useCallback((url?: string) => {
+    const repo = (url ?? repoUrl).trim()
+    if (!repo.startsWith(REPO_URL_PREFIX)) return
+    setRepoUrl(repo)
+
     closeConnection()
     setStage('planning')
     setStatusMessage('Connecting to backend...')
@@ -136,23 +147,31 @@ function App() {
     lastAttemptRef.current = 0
     setCurrentAttempt(0)
 
-    const es = new EventSource('http://localhost:8000/api/plan/stream')
+    // repo_url is a required query param on the backend, and must be encoded
+    // since it is itself a URL.
+    const es = new EventSource(
+      `http://localhost:8000/api/plan/stream?repo_url=${encodeURIComponent(repo)}`,
+    )
     eventSourceRef.current = es
 
-    let connected = false
+    // True once a backend-sent {"type": "error"} has been shown for THIS
+    // attempt, so the native onerror handler never overwrites it.
+    let errorShown = false
 
     es.onopen = () => {
-      connected = true
       setConnectionError(false)
     }
 
     es.onerror = () => {
-      if (!connected) {
-        setConnectionError(true)
-        setErrorMessage('Could not connect to the backend. Is it running on localhost:8000?')
-        es.close()
-        eventSourceRef.current = null
+      // Close immediately: without this the browser keeps auto-reconnecting
+      // to a stream the backend has already (intentionally) ended, leaving
+      // the UI spinning on "Connecting to backend..." forever.
+      es.close()
+      if (eventSourceRef.current === es) eventSourceRef.current = null
+      if (!errorShown) {
+        setErrorMessage('Lost connection to the backend. Please try again.')
       }
+      setConnectionError(true)
     }
 
     es.onmessage = (event) => {
@@ -169,14 +188,16 @@ function App() {
             setStatusMessage(data.message)
             break
           case 'error':
+            errorShown = true
             setErrorMessage(data.message)
+            setConnectionError(true)
             es.close()
-            eventSourceRef.current = null
+            if (eventSourceRef.current === es) eventSourceRef.current = null
             break
           case 'plan_complete':
             setPlan(data.plan)
             es.close()
-            eventSourceRef.current = null
+            if (eventSourceRef.current === es) eventSourceRef.current = null
             setStage('review')
             break
         }
@@ -184,7 +205,7 @@ function App() {
         // ignore malformed messages
       }
     }
-  }, [closeConnection])
+  }, [closeConnection, repoUrl])
 
   // ── Stage 3 → 4: Run Migration ────────────────────────────────────────
 
@@ -223,20 +244,27 @@ function App() {
     const es = new EventSource('http://localhost:8000/api/migrate/stream')
     eventSourceRef.current = es
 
-    let connected = false
+    // True once a backend-sent {"type": "error"} has been shown for THIS
+    // attempt, so the native onerror handler never overwrites it.
+    let errorShown = false
 
     es.onopen = () => {
-      connected = true
       setConnectionError(false)
     }
 
     es.onerror = () => {
-      if (!connected) {
-        setConnectionError(true)
-        setErrorMessage('Could not connect to the backend. Is it running on localhost:8000?')
-        es.close()
-        eventSourceRef.current = null
+      // Close immediately to stop the browser's automatic reconnect — a
+      // reconnect would otherwise re-run the whole migration from scratch.
+      es.close()
+      if (eventSourceRef.current === es) eventSourceRef.current = null
+      if (!errorShown) {
+        setErrorMessage('Lost connection to the backend. Please try again.')
       }
+      setConnectionError(true)
+      // The stream is over: retire any in-flight verification spinners so
+      // the timeline can't spin forever behind the error banner.
+      const attempts = lastAttemptRef.current
+      setFinalSummary((prev) => prev ?? { verified: false, attempts })
     }
 
     es.onmessage = (event) => {
@@ -328,9 +356,19 @@ function App() {
             }))
             break
 
-          case 'error':
+          case 'error': {
+            errorShown = true
             setErrorMessage(data.message)
+            setConnectionError(true)
+            // The backend ends the stream right after an error event — close
+            // so the browser does not auto-reconnect and re-run the migration.
+            es.close()
+            if (eventSourceRef.current === es) eventSourceRef.current = null
+            // No execution_complete is coming, so settle in-flight spinners.
+            const attempts = lastAttemptRef.current
+            setFinalSummary((prev) => prev ?? { verified: false, attempts })
             break
+          }
 
           case 'execution_complete': {
             const verified = data.verified ?? false
@@ -379,10 +417,25 @@ function App() {
     setFinalSummary(null)
     lastAttemptRef.current = 0
     setCurrentAttempt(0)
+    setRepoUrl(DEFAULT_REPO_URL)
   }, [closeConnection])
 
   const toggleOutput = useCallback((attempt: number) => {
     setExpandedAttempts((prev) => ({ ...prev, [attempt]: !prev[attempt] }))
+  }, [])
+
+  /**
+   * Hand the download off to the browser. The endpoint responds with
+   * Content-Disposition: attachment, so this triggers a save dialog even
+   * though the backend is on a different origin.
+   */
+  const handleDownload = useCallback(() => {
+    const a = document.createElement('a')
+    a.href = 'http://localhost:8000/api/download/zip'
+    a.download = 'migrated-app.zip'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
   }, [])
 
   const toggleCard = useCallback((idx: number) => {
@@ -390,6 +443,11 @@ function App() {
   }, [])
 
   // ── Derived state ──────────────────────────────────────────────────────
+
+  const trimmedRepoUrl = repoUrl.trim()
+  const repoUrlValid = trimmedRepoUrl.startsWith(REPO_URL_PREFIX)
+  // Only nag once the user has actually typed something invalid.
+  const showRepoHint = trimmedRepoUrl.length > 0 && !repoUrlValid
 
   const sortedFiles = plan ? [...plan.files].sort((a, b) => a.priority - b.priority) : []
   const totalFiles = sortedFiles.length
@@ -480,7 +538,7 @@ function App() {
       <section className="verify-panel">
         <div className="verify-panel-header">
           <h2 className="section-title">Build Verification</h2>
-          {stage !== 'complete' && (
+          {stage !== 'complete' && !errorMessage && (
             <span className="verify-live">
               <span className="badge-spinner badge-spinner--dark" />
               In progress
@@ -527,7 +585,10 @@ function App() {
             <span className="banner-icon">✕</span>
             <span>{errorMessage}</span>
             {(stage === 'planning' || stage === 'executing' || connectionError) && (
-              <button className="banner-btn" onClick={handleStartOver}>
+              <button
+                className="banner-btn"
+                onClick={() => handleStartPlanning(DEFAULT_REPO_URL)}
+              >
                 Try Again
               </button>
             )}
@@ -549,14 +610,54 @@ function App() {
                 />
               </svg>
             </div>
-            <button className="btn btn--primary" onClick={handleStartPlanning}>
-              Start Planning
-            </button>
+
+            <form
+              className="repo-form"
+              onSubmit={(e) => {
+                e.preventDefault()
+                if (repoUrlValid) handleStartPlanning()
+              }}
+            >
+              <label className="repo-label" htmlFor="repo-url">
+                Enter a public GitHub repo URL (small-to-medium vanilla jQuery app)
+              </label>
+
+              <input
+                id="repo-url"
+                className={`repo-input${showRepoHint ? ' repo-input--invalid' : ''}`}
+                type="text"
+                value={repoUrl}
+                onChange={(e) => setRepoUrl(e.target.value)}
+                placeholder="https://github.com/owner/repo"
+                spellCheck={false}
+                autoComplete="off"
+                autoCapitalize="off"
+                aria-invalid={showRepoHint}
+                aria-describedby={showRepoHint ? 'repo-url-hint' : undefined}
+              />
+
+              {showRepoHint && (
+                <p className="repo-hint" id="repo-url-hint">
+                  Must be a public github.com repository URL
+                </p>
+              )}
+
+              <p className="repo-note">
+                Works best on small-to-medium vanilla jQuery apps without heavy external
+                dependencies or build tooling.
+              </p>
+
+              <button className="btn btn--primary" type="submit" disabled={!repoUrlValid}>
+                Start Planning
+              </button>
+            </form>
           </div>
         )}
 
         {/* ── Stage 2: Planning ── */}
-        {stage === 'planning' && (
+        {/* Once an error is shown the spinner is retired, so the UI never
+            keeps "Connecting to backend..." spinning beside the banner. */}
+        {stage === 'planning' && !errorMessage && (
           <div className="planning">
             <div className="spinner" />
             <p className="status-line">{statusMessage || 'Connecting...'}</p>
@@ -588,23 +689,27 @@ function App() {
         {/* ── Stage 4: Executing ── */}
         {stage === 'executing' && plan && (
           <div className="executing">
-            <div className="executing-status">
-              {verificationStarted ? (
-                <>
-                  <div className="spinner" />
-                  <span>
-                    Running build verification (attempt {currentAttempt || 1})...
-                  </span>
-                </>
-              ) : (
-                <>
-                  <div className="spinner" />
-                  <span>
-                    Generating migrated files... {generatedCount}/{totalFiles}
-                  </span>
-                </>
-              )}
-            </div>
+            {/* Same as planning: once an error is shown, retire the spinner
+                so the UI isn't stuck loading behind the error banner. */}
+            {!errorMessage && (
+              <div className="executing-status">
+                {verificationStarted ? (
+                  <>
+                    <div className="spinner" />
+                    <span>
+                      Running build verification (attempt {currentAttempt || 1})...
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <div className="spinner" />
+                    <span>
+                      Generating migrated files... {generatedCount}/{totalFiles}
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
 
             {renderFileList()}
             {renderVerificationPanel()}
@@ -637,6 +742,11 @@ function App() {
             {renderFileList()}
 
             <div className="action-bar">
+              {finalSummary?.verified && (
+                <button className="btn btn--primary" onClick={handleDownload}>
+                  Download Migrated App (.zip)
+                </button>
+              )}
               <button className="btn btn--secondary" onClick={handleStartOver}>
                 Start Over
               </button>

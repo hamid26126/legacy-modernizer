@@ -38,13 +38,32 @@ def normalize_plan(plan: dict) -> dict:
 
     entry_js = None
     if js_entries:
-        # Prefer whichever JS file the model already mapped to the React entry —
-        # priority alone can rank a service worker above the real app logic.
         already_tagged = [f for f in js_entries if f.get("new_path") == "src/App.jsx"]
-        if already_tagged:
+
+        # Prefer files whose original name suggests main application logic
+        # over service workers, which are a distinct, non-UI script type.
+        def is_likely_service_worker(f):
+            name = Path(f["path"]).stem.lower()
+            return "service-worker" in name or name in ("sw", "serviceworker")
+
+        recovered_non_sw = [
+            f for f in js_entries
+            if str(f.get("new_path", "")).startswith("src/_recovered_")
+            and not is_likely_service_worker(f)
+        ]
+        tagged_non_sw = [f for f in already_tagged if not is_likely_service_worker(f)]
+        if recovered_non_sw and not tagged_non_sw:
+            # Safety net (ensure_core_files_present): the model omitted a core
+            # non-service-worker JS file entirely. The recovered copy must become
+            # the entry even if the model explicitly tagged a service worker as
+            # src/App.jsx — a plan missing its core logic is broken either way.
+            entry_js = recovered_non_sw[0]
+        elif already_tagged:
             entry_js = already_tagged[0]
         else:
-            entry_js = max(js_entries, key=lambda f: f.get("priority", 0))
+            non_sw = [f for f in js_entries if not is_likely_service_worker(f)]
+            candidates = non_sw if non_sw else js_entries
+            entry_js = max(candidates, key=lambda f: f.get("priority", 0))
         entry_js["new_path"] = "src/App.jsx"
 
     # Any OTHER js file must not keep a new_path that could collide with the
@@ -86,3 +105,50 @@ def get_plan_cache_path(repo_path: Path, cache_key: str | None = None) -> Path:
     key_source = cache_key if cache_key else str(Path(repo_path).resolve())
     key = hashlib.sha256(key_source.encode()).hexdigest()[:16]
     return Path(__file__).parent / f"plan_cache_{key}.json"
+
+
+def dedupe_plan_paths(plan: dict) -> dict:
+    """
+    Removes duplicate entries sharing the same original 'path' — keeping only
+    the first occurrence. This guards against degenerate plans where the model
+    lists the same file many times (observed: 11 duplicate index.html entries
+    in one real-world test).
+    """
+    seen = set()
+    deduped = []
+    for entry in plan.get("files", []):
+        path = entry.get("path")
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(entry)
+    plan["files"] = deduped
+    return plan
+
+
+def ensure_core_files_present(plan: dict, migratable_files: list) -> dict:
+    """
+    Safety net: if the plan completely omits a real, relevant JS file from the
+    repo (the most likely place for core app logic to live), add it back with
+    safe defaults rather than silently proceeding without it. This has been
+    observed to happen — the model's plan omitting script.js entirely while
+    still being schema-valid otherwise.
+    """
+    planned_paths = {f.get("path") for f in plan.get("files", [])}
+    max_priority = max((f.get("priority", 0) for f in plan.get("files", [])), default=0)
+
+    for rel_path in migratable_files:
+        if rel_path.endswith(".js") and rel_path not in planned_paths:
+            max_priority += 1
+            plan.setdefault("files", []).append({
+                "path": rel_path,
+                "new_path": f"src/_recovered_{Path(rel_path).stem}.jsx",
+                "priority": max_priority,
+                "depends_on": [],
+                "migration_notes": (
+                    "This file was omitted from the original plan and has been "
+                    "automatically added back. Convert its jQuery logic to React "
+                    "following the same conventions as other files in this migration."
+                ),
+            })
+    return plan

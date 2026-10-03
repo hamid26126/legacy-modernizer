@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import shutil
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -24,19 +25,39 @@ OUTPUT_PATH = Path(__file__).parent.parent / "output"
 
 def build_fixed_index_html(original_html: str) -> str:
     """
-    index.html is NOT sent to the LLM. Its entry script must exactly match our
-    sandbox scaffold (src/main.jsx) — letting the model regenerate this file
-    was causing non-deterministic build failures from guessed entry paths.
-    We build it from a fixed template and just preserve the original title.
+    index.html is not sent to the LLM. Its entry script must exactly match our
+    sandbox scaffold (src/main.jsx). We build it from a fixed template, but we
+    DO preserve the original's <title> and any external stylesheet/font <link>
+    tags from its <head> — these (Bootstrap, Font Awesome, Google Fonts, etc.)
+    are often load-bearing for the migrated app's visual appearance, since the
+    migrated CSS file assumes those base styles are still present.
     """
-    match = re.search(r"<title>(.*?)</title>", original_html, re.IGNORECASE | re.DOTALL)
-    title = match.group(1).strip() if match else "App"
+    title_match = re.search(r"<title>(.*?)</title>", original_html, re.IGNORECASE | re.DOTALL)
+    title = title_match.group(1).strip() if title_match else "App"
+
+    link_tags = re.findall(r'<link\b[^>]*>', original_html, re.IGNORECASE)
+    external_links = []
+    for tag in link_tags:
+        href_match = re.search(r'href=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        rel_match = re.search(r'rel=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        if not href_match or not rel_match:
+            continue
+        href = href_match.group(1)
+        rel = rel_match.group(1).lower()
+        # Only keep genuinely external links (CDNs), and only stylesheet/font-related ones.
+        # Skip local/relative hrefs (e.g. href="style.css") since that file is being
+        # migrated separately and will conflict with our own index.css.
+        if href.startswith(("http://", "https://", "//")) and rel in ("stylesheet", "preconnect", "dns-prefetch"):
+            external_links.append(f'    <link rel="{rel}" href="{href}">')
+
+    links_html = "\n" + "\n".join(external_links) if external_links else ""
+
     return f"""<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>{title}</title>
+    <title>{title}</title>{links_html}
   </head>
   <body>
     <div id="root"></div>
@@ -52,7 +73,14 @@ def load_plan(repo_path: Path, cache_key: str | None = None) -> dict:
     return normalize_plan(json.loads(plan_cache.read_text()))
 
 
-def migrate_file(original_path: str, new_path: str, migration_notes: str, original_content: str) -> str:
+def extract_html_body(html_content: str) -> str:
+    """Extract just the <body> content from an HTML file, to use as
+    structural reference context without spending tokens on <head>."""
+    match = re.search(r"<body[^>]*>(.*?)</body>", html_content, re.IGNORECASE | re.DOTALL)
+    return match.group(1).strip() if match else html_content
+
+
+def migrate_file(original_path: str, new_path: str, migration_notes: str, original_content: str, html_reference=None) -> str:
     """Send one file to Super with its specific migration notes, get back the converted code."""
     system_msg = (
     "You are an expert React developer performing a precise jQuery-to-React "
@@ -74,6 +102,21 @@ def migrate_file(original_path: str, new_path: str, migration_notes: str, origin
     "(`export default ComponentName;`). Do NOT call createRoot, ReactDOM.render, or any "
     "app-mounting code inside this file — the application's entry point (main.jsx) already "
     "handles mounting and expects to import this file's default export. "
+    "STRUCTURAL FIDELITY: The original HTML's class names, ids, and overall element "
+    "nesting/wrapper structure (e.g. header/container/footer wrapping elements) often have "
+    "CSS rules written specifically against them. You MUST preserve every original id and "
+    "class name EXACTLY on the JSX element that serves the equivalent role — do not rename, "
+    "abbreviate, or invent new class/id names, and do not remove structural wrapper elements "
+    "(headers, containers, footers) even if they seem redundant. If you are unsure what an "
+    "element's original class or id was, re-use it verbatim rather than guessing a new one. "
+    "AVOID DUPLICATE RENDERING: If the original code referenced multiple DOM containers for "
+    "what is conceptually the same piece of data (e.g. a history list, a results panel), "
+    "check carefully whether those containers were ALL actually visible and populated in the "
+    "original, or whether some were dead/unused code (e.g. targeting an element id that "
+    "doesn't exist in the original HTML, or hidden via CSS). Render each piece of data in "
+    "exactly ONE place in your migrated component, matching wherever the original ACTUALLY "
+    "displayed it — never render the same data in two different visible locations unless the "
+    "original genuinely did so simultaneously. "
     "Respond with ONLY the final code for the new file — no markdown fences, "
     "no explanation, no commentary. Just the raw file content, ready to write to disk."
 )
@@ -82,8 +125,17 @@ def migrate_file(original_path: str, new_path: str, migration_notes: str, origin
         f"NEW FILE PATH: {new_path}\n\n"
         f"MIGRATION NOTES FOR THIS FILE:\n{migration_notes}\n\n"
         f"ORIGINAL CONTENT:\n{original_content}\n\n"
-        "Produce the migrated file content now."
     )
+    if html_reference:
+        user_msg += (
+            f"ORIGINAL HTML STRUCTURE (for reference only — this is the original "
+            f"index.html's body, showing the exact ids/classes this script's logic "
+            f"was written against; it is NOT being migrated by you, it exists only so "
+            f"you preserve the correct ids/classes and understand which DOM elements "
+            f"genuinely existed vs. which selectors in the script might target "
+            f"nonexistent elements):\n{html_reference}\n\n"
+        )
+    user_msg += "Produce the migrated file content now."
     response = client.chat.completions.create(
         model=SUPER_MODEL,
         messages=[
@@ -170,11 +222,23 @@ def execute_plan_stream(repo_path: Path, cache_key: str | None = None):
         return
 
     files = sorted(plan["files"], key=lambda f: f.get("priority", 0))
+    # Wipe output/ so a new migration never inherits files (or stale
+    # _unused_ placeholders) from a previous run.
+    shutil.rmtree(OUTPUT_PATH, ignore_errors=True)
     OUTPUT_PATH.mkdir(exist_ok=True)
 
     migrated = {}
     file_meta = {}
     generation_failed = False
+
+    html_reference = None
+    html_entry = next((f for f in files if f["path"].lower().endswith(".html")), None)
+    if html_entry:
+        try:
+            html_original = (repo_path / html_entry["path"]).read_text(encoding="utf-8")
+            html_reference = extract_html_body(html_original)
+        except Exception:
+            html_reference = None
 
     for entry in files:
         original_path = entry["path"]
@@ -195,7 +259,7 @@ def execute_plan_stream(repo_path: Path, cache_key: str | None = None):
             if entry["path"].lower().endswith(".html"):
                 content = build_fixed_index_html(original_content)
             else:
-                content = call_with_retry(migrate_file, original_path, new_path, notes, original_content)
+                content = call_with_retry(migrate_file, original_path, new_path, notes, original_content, html_reference)
 
             migrated[new_path] = content
             output_file = OUTPUT_PATH / new_path

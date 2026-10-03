@@ -127,6 +127,24 @@ body {
   box-shadow: var(--shadow-md);
 }
 
+/* Disabled: greyed out, not clickable */
+.btn:disabled,
+.btn--primary:disabled,
+.btn--secondary:disabled {
+  background: var(--color-border);
+  color: #9ca3af;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.btn--primary:disabled:hover,
+.btn--secondary:disabled:hover {
+  background: var(--color-border);
+  box-shadow: none;
+  transform: none;
+}
+
 /* ── Banners ───────────────────────────────────────────────────────────── */
 .banner {
   display: flex;
@@ -192,6 +210,71 @@ body {
 
 .idle-icon {
   opacity: 0.9;
+}
+
+/* ── Repo URL Form ────────────────────────────────────────────────────── */
+.repo-form {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 520px;
+  gap: 8px;
+  text-align: left;
+}
+
+.repo-form > .btn {
+  margin-top: 10px;
+  align-self: center;
+}
+
+.repo-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.repo-input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 11px 14px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.repo-input::placeholder {
+  color: var(--color-pending);
+}
+
+.repo-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+
+.repo-input--invalid {
+  border-color: var(--color-error);
+}
+
+.repo-input--invalid:focus {
+  border-color: var(--color-error);
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.15);
+}
+
+.repo-hint {
+  font-size: 12px;
+  font-weight: 500;
+  color: #b91c1c;
+}
+
+.repo-note {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
 }
 
 /* ── Planning Stage ────────────────────────────────────────────────────── */
@@ -542,6 +625,8 @@ body {
 .action-bar {
   display: flex;
   justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
   padding: 28px 0 0;
 }
 

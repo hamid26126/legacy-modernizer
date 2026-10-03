@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+from utils import call_with_retry
+
 MAX_REPO_FILES = 60          # safety cap — reject repos larger than this
 RELEVANT_EXTENSIONS = {".js", ".html", ".css"}
 
@@ -35,12 +37,15 @@ def clone_repo(url: str) -> Path:
     clone_url = validate_github_url(url)
     dest = Path(tempfile.mkdtemp(prefix="legacy_modernizer_"))
     try:
-        subprocess.run(
+        call_with_retry(
+            subprocess.run,
             ["git", "clone", "--depth", "1", clone_url, str(dest)],
             check=True,
             capture_output=True,
             text=True,
             timeout=60,
+            retries=2,
+            delay=3,
         )
     except subprocess.CalledProcessError as e:
         shutil.rmtree(dest, ignore_errors=True)

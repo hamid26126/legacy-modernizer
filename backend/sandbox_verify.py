@@ -16,6 +16,7 @@ BASE_PACKAGE_JSON = json.dumps({
     "version": "0.0.0",
     "type": "module",
     "scripts": {
+        "dev": "vite",
         "build": "vite build",
         "lint": "eslint src --ext js,jsx || true"
     },

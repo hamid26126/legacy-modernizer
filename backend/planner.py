@@ -158,21 +158,24 @@ def validate_plan(plan: dict) -> list:
 
 
 def _parse_and_prune(raw, repo_path: Path):
-    """Parse a model response into a usable plan. Returns (plan, problems).
-    Unparseable JSON, a missing 'files' array, or entries that name non-existent
-    files are all reported as problems so the caller can trigger one correction."""
+    """Parse a model response into a usable plan. Returns (plan, problems, dropped).
+    Unparseable JSON or a missing 'files' array are reported as problems so the
+    caller can trigger one correction. Phantom entries naming non-existent files
+    are pruned and are NOT a problem by themselves: pruning one bad entry out of
+    an otherwise-valid plan is the pruning mechanism working correctly. They are
+    only fatal if nothing valid is left after pruning."""
     try:
         plan = parse_json_response(raw)
     except Exception as e:
-        return None, [f"Response was not valid JSON ({type(e).__name__}: {e}). Output complete JSON only."]
+        return None, [f"Response was not valid JSON ({type(e).__name__}: {e}). Output complete JSON only."], []
     if not isinstance(plan, dict) or not isinstance(plan.get("files"), list):
-        return None, validate_plan(plan if isinstance(plan, dict) else {})
+        return None, validate_plan(plan if isinstance(plan, dict) else {}), []
     dropped = prune_plan(plan, repo_path)
     problems = validate_plan(plan)
-    if dropped:
-        problems.insert(0, "Ignored " + str(len(dropped)) + " entries naming files that do not exist: "
+    if dropped and not plan["files"]:
+        problems.insert(0, "All entries named files that do not exist; nothing left to migrate: "
                         + ", ".join(dropped[:8]))
-    return plan, problems
+    return plan, problems, dropped
 
 
 def get_migration_plan_stream(repo_path: Path, force_refresh: bool = False, cache_key: str | None = None):
@@ -195,7 +198,8 @@ def get_migration_plan_stream(repo_path: Path, force_refresh: bool = False, cach
         tavily_context = ground_with_tavily("jQuery to React migration guide best practices 2026")
 
         yield {"type": "progress", "step": "planning", "message": "Calling Nemotron 3 Ultra for the migration plan (this costs credits)..."}
-        messages = build_prompt(repo_content, tavily_context, list_migratable_files(repo_path))
+        migratable_files = list_migratable_files(repo_path)
+        messages = build_prompt(repo_content, tavily_context, migratable_files)
         response = call_with_retry(
             client.chat.completions.create,
             model=ULTRA_MODEL,
@@ -204,7 +208,7 @@ def get_migration_plan_stream(repo_path: Path, force_refresh: bool = False, cach
             max_tokens=12000,
         )
         raw = response.choices[0].message.content
-        plan, problems = _parse_and_prune(raw, repo_path)
+        plan, problems, dropped = _parse_and_prune(raw, repo_path)
         if problems:
             yield {"type": "info", "message": "Plan did not match the required schema - retrying with a correction..."}
             correction_messages = messages + [
@@ -218,7 +222,12 @@ def get_migration_plan_stream(repo_path: Path, force_refresh: bool = False, cach
                     "Do NOT write a project plan, phase breakdown, task list, risk register or "
                     "timeline. Keep each migration_notes under 60 words and overall_notes under 40 "
                     "words so the JSON is not cut off.\n\n"
-                    "Problems found:\n- " + "\n- ".join(problems[:20])
+                    "Problems found:\n- " + "\n- ".join(problems[:20]) + "\n\n"
+                    "Your response did not match the required schema, OR listed files that don't exist in "
+                    "this repository. You MUST respond with ONLY a JSON object containing a top-level "
+                    "'files' array. Each entry's 'path' MUST be exactly one of these real files — do not "
+                    "invent any other path: " + ", ".join(migratable_files) + ". "
+                    "Do not list any file more than once. Try again now."
                 )},
             ]
             response = call_with_retry(
@@ -229,12 +238,21 @@ def get_migration_plan_stream(repo_path: Path, force_refresh: bool = False, cach
                 max_tokens=12000,
             )
             raw = response.choices[0].message.content
-            plan, remaining = _parse_and_prune(raw, repo_path)
+            plan, remaining, dropped = _parse_and_prune(raw, repo_path)
             if remaining:
                 raise ValueError(
                     "Plan still did not match the required schema after one correction attempt: "
                     + "; ".join(remaining[:10])
                 )
+
+        if dropped and plan is not None and plan.get("files"):
+            yield {"type": "info", "message": f"Pruned {len(dropped)} invalid file entries from the plan; proceeding with {len(plan['files'])} valid entries."}
+
+        from utils import dedupe_plan_paths, ensure_core_files_present
+        plan = dedupe_plan_paths(plan)
+        plan = ensure_core_files_present(plan, migratable_files)
+        if not plan.get("files"):
+            raise ValueError("Plan has no valid file entries after pruning and safety nets.")
 
         plan = normalize_plan(plan)
 
