@@ -1,5 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import type { ReactNode } from 'react'
+import { useNotice } from './useNotice'
+import { Notice } from './Notice'
 import './App.css'
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -17,10 +19,20 @@ interface Plan {
   overall_notes: string
 }
 
+/**
+ * Per-file status in `execution_complete.results`.
+ *
+ * - pass / fail — a full verification run finished
+ * - unverified — sandbox setup failed before verification could start
+ * - generated / generation_failed — the run stopped after generation errors,
+ *   with the successes and failures reported individually
+ */
+type ResultStatus = 'pass' | 'fail' | 'unverified' | 'generated' | 'generation_failed'
+
 interface MigrationResult {
   file: string
   new_path: string
-  status: string
+  status: ResultStatus
 }
 
 /**
@@ -28,18 +40,27 @@ interface MigrationResult {
  *
  * `execution_complete.verified` / `.attempts` are optional because the backend
  * omits them when sandbox setup fails before verification ever starts.
+ * `file_generated.reused` marks a file that a resumed run read back from disk
+ * instead of regenerating.
  */
 type MigrateEvent =
   | { type: 'file_start'; file: string; new_path: string }
-  | { type: 'file_generated'; file: string; new_path: string }
+  | { type: 'file_generated'; file: string; new_path: string; reused?: boolean }
   | { type: 'file_error'; file: string; message: string }
   | { type: 'verify_start'; attempt: number }
-  | { type: 'verify_result'; attempt: number; passed: boolean; output: string }
+  | { type: 'verify_stage_progress'; attempt: number; stage: string; message: string }
+  | {
+      type: 'verify_result'
+      attempt: number
+      passed: boolean
+      stage?: 'build' | 'lint' | null
+      output: string
+    }
   | { type: 'file_fixing'; new_path: string; attempt: number }
   | { type: 'file_fixed'; new_path: string; attempt: number }
   | { type: 'info'; message: string }
   | { type: 'error'; message: string }
-  | { type: 'file_complete'; file: string; new_path: string; status: string }
+  | { type: 'file_complete'; file: string; new_path: string; status: 'pass' | 'fail' }
   | {
       type: 'execution_complete'
       results: MigrationResult[]
@@ -66,7 +87,14 @@ interface FileStatusEntry {
 /** One row of the build-verification timeline. */
 type TimelineEntry =
   | { kind: 'verify_start'; attempt: number }
-  | { kind: 'verify_result'; attempt: number; passed: boolean; output: string }
+  | { kind: 'lint_check'; attempt: number; message: string }
+  | {
+      kind: 'verify_result'
+      attempt: number
+      passed: boolean
+      stage?: 'build' | 'lint' | null
+      output: string
+    }
   | { kind: 'fixing'; newPath: string; attempt: number }
   | { kind: 'fixed'; newPath: string; attempt: number }
   | { kind: 'note'; message: string }
@@ -92,16 +120,38 @@ const CARD_STATUS_CLASS: Record<FileStatus, string> = {
   unverified: 'unverified',
 }
 
+/**
+ * Cards kept as-is when a run is resumed: every one of these states means the
+ * file was successfully written to output/, so it must not flash back to
+ * pending while the retry reuses it. Failed/pending/generating cards reset.
+ */
+const KEEP_ON_RESUME: ReadonlySet<FileStatus> = new Set([
+  'generated',
+  'verified',
+  'unverified',
+])
+
+/** Map execution_complete result statuses onto per-card badge states. */
+const RESULT_STATUS_MAP: Record<ResultStatus, FileStatus> = {
+  pass: 'verified',
+  fail: 'unverified',
+  unverified: 'unverified',
+  generated: 'generated',
+  generation_failed: 'gen_failed',
+}
+
 // ── Component ──────────────────────────────────────────────────────────────
 
 function App() {
   const [stage, setStage] = useState<Stage>('idle')
+  // Persistent progress line for the planning stage — updates in place with
+  // each progress/info event, cleared only on plan_complete or error.
   const [statusMessage, setStatusMessage] = useState('')
-  const [errorMessage, setErrorMessage] = useState('')
+  // The single dismissible-notice slot used by every banner in the app.
+  const { notice, showNotice, dismissNotice } = useNotice()
   const [plan, setPlan] = useState<Plan | null>(null)
   const [fileStatuses, setFileStatuses] = useState<Record<string, FileStatusEntry>>({})
   const [expandedCards, setExpandedCards] = useState<Record<number, boolean>>({})
-  const [connectionError, setConnectionError] = useState(false)
   const [repoUrl, setRepoUrl] = useState(DEFAULT_REPO_URL)
 
   // Verification timeline state
@@ -110,6 +160,9 @@ function App() {
   const [expandedAttempts, setExpandedAttempts] = useState<Record<number, boolean>>({})
   const [finalSummary, setFinalSummary] = useState<FinalSummary | null>(null)
   const [currentAttempt, setCurrentAttempt] = useState(0)
+  // Live status line for Stage 4 — updated per phase (build, lint, fix) so the
+  // header text never goes stale while a different phase is actually running.
+  const [executingStatus, setExecutingStatus] = useState('')
 
   const eventSourceRef = useRef<EventSource | null>(null)
   const lastAttemptRef = useRef(0)
@@ -127,16 +180,18 @@ function App() {
 
   // ── Stage 1: Idle ──────────────────────────────────────────────────────
 
-  const handleStartPlanning = useCallback((url?: string) => {
-    const repo = (url ?? repoUrl).trim()
+  // Always plans the URL currently in the input — there is deliberately no
+  // way to call this with a different (e.g. default/example) URL, so an error
+  // can never silently resubmit something the user didn't just confirm.
+  const handleStartPlanning = useCallback(() => {
+    const repo = repoUrl.trim()
     if (!repo.startsWith(REPO_URL_PREFIX)) return
     setRepoUrl(repo)
 
     closeConnection()
     setStage('planning')
     setStatusMessage('Connecting to backend...')
-    setErrorMessage('')
-    setConnectionError(false)
+    dismissNotice()
     setPlan(null)
     setFileStatuses({})
     setExpandedCards({})
@@ -144,6 +199,7 @@ function App() {
     setVerificationStarted(false)
     setExpandedAttempts({})
     setFinalSummary(null)
+    setExecutingStatus('')
     lastAttemptRef.current = 0
     setCurrentAttempt(0)
 
@@ -158,10 +214,6 @@ function App() {
     // attempt, so the native onerror handler never overwrites it.
     let errorShown = false
 
-    es.onopen = () => {
-      setConnectionError(false)
-    }
-
     es.onerror = () => {
       // Close immediately: without this the browser keeps auto-reconnecting
       // to a stream the backend has already (intentionally) ended, leaving
@@ -169,9 +221,12 @@ function App() {
       es.close()
       if (eventSourceRef.current === es) eventSourceRef.current = null
       if (!errorShown) {
-        setErrorMessage('Lost connection to the backend. Please try again.')
+        showNotice('Lost connection to the backend. Please try again.')
       }
-      setConnectionError(true)
+      setStatusMessage('')
+      // Back to the input screen with the typed URL intact — the user edits
+      // and resubmits explicitly; nothing is ever retried automatically.
+      setStage('idle')
     }
 
     es.onmessage = (event) => {
@@ -189,12 +244,17 @@ function App() {
             break
           case 'error':
             errorShown = true
-            setErrorMessage(data.message)
-            setConnectionError(true)
+            showNotice(data.message)
+            setStatusMessage('')
             es.close()
             if (eventSourceRef.current === es) eventSourceRef.current = null
+            // Clone failure, non-jQuery rejection, planner error — all land
+            // here: show the message on the input screen, pre-filled with the
+            // URL that produced it, and wait for the user to edit + resubmit.
+            setStage('idle')
             break
           case 'plan_complete':
+            setStatusMessage('')
             setPlan(data.plan)
             es.close()
             if (eventSourceRef.current === es) eventSourceRef.current = null
@@ -205,11 +265,17 @@ function App() {
         // ignore malformed messages
       }
     }
-  }, [closeConnection, repoUrl])
+  }, [closeConnection, repoUrl, dismissNotice, showNotice])
 
   // ── Stage 3 → 4: Run Migration ────────────────────────────────────────
 
-  const handleRunMigration = useCallback(() => {
+  /**
+   * Starts a migration stream. `resume: true` is the retry path: the backend
+   * reuses every file already generated for this plan and only (re)generates
+   * the missing/failed ones, so cards for files that already exist are kept
+   * instead of being reset.
+   */
+  const startMigration = useCallback((resume: boolean) => {
     if (!plan) return
 
     /**
@@ -224,33 +290,40 @@ function App() {
 
     closeConnection()
     setStage('executing')
-    setErrorMessage('')
-    setConnectionError(false)
+    dismissNotice()
 
-    // Verification timeline state
+    // Verification timeline state — always fresh, so a retry gets its own
+    // clean Build Verification section.
     setTimeline([])
     setVerificationStarted(false)
     setExpandedAttempts({})
     setFinalSummary(null)
+    setExecutingStatus('')
     lastAttemptRef.current = 0
     setCurrentAttempt(0)
 
-    const initial: Record<string, FileStatusEntry> = {}
-    for (const f of plan.files) {
-      initial[f.path] = { status: 'pending' }
-    }
-    setFileStatuses(initial)
+    setFileStatuses((prev) => {
+      const next: Record<string, FileStatusEntry> = {}
+      for (const f of plan.files) {
+        const existing = prev[f.path]
+        if (resume && existing && KEEP_ON_RESUME.has(existing.status)) {
+          // Already generated (and possibly verified) — stays visible.
+          next[f.path] = existing
+        } else {
+          next[f.path] = { status: 'pending' }
+        }
+      }
+      return next
+    })
 
-    const es = new EventSource('http://localhost:8000/api/migrate/stream')
+    const es = new EventSource(
+      `http://localhost:8000/api/migrate/stream${resume ? '?resume=true' : ''}`,
+    )
     eventSourceRef.current = es
 
     // True once a backend-sent {"type": "error"} has been shown for THIS
     // attempt, so the native onerror handler never overwrites it.
     let errorShown = false
-
-    es.onopen = () => {
-      setConnectionError(false)
-    }
 
     es.onerror = () => {
       // Close immediately to stop the browser's automatic reconnect — a
@@ -258,9 +331,8 @@ function App() {
       es.close()
       if (eventSourceRef.current === es) eventSourceRef.current = null
       if (!errorShown) {
-        setErrorMessage('Lost connection to the backend. Please try again.')
+        showNotice('Lost connection to the backend. Please try again.')
       }
-      setConnectionError(true)
       // The stream is over: retire any in-flight verification spinners so
       // the timeline can't spin forever behind the error banner.
       const attempts = lastAttemptRef.current
@@ -306,18 +378,38 @@ function App() {
             lastAttemptRef.current = data.attempt
             setCurrentAttempt(data.attempt)
             setVerificationStarted(true)
+            setExecutingStatus(`Running build verification (attempt ${data.attempt})...`)
             setTimeline((prev) => [...prev, { kind: 'verify_start', attempt: data.attempt }])
+            break
+
+          // Build finished; ESLint is now running. Distinct timeline row so
+          // the user sees "build ok, lint in progress" instead of one opaque
+          // "verifying..." state covering both stages.
+          case 'verify_stage_progress':
+            lastAttemptRef.current = data.attempt
+            setCurrentAttempt(data.attempt)
+            setExecutingStatus(data.message)
+            setTimeline((prev) => [
+              ...prev,
+              { kind: 'lint_check', attempt: data.attempt, message: data.message },
+            ])
             break
 
           case 'verify_result':
             lastAttemptRef.current = data.attempt
             setCurrentAttempt(data.attempt)
+            setExecutingStatus(
+              data.passed
+                ? `Attempt ${data.attempt} — build and lint passed`
+                : `Attempt ${data.attempt} — ${data.stage === 'lint' ? 'lint' : 'build'} failed`,
+            )
             setTimeline((prev) => [
               ...prev,
               {
                 kind: 'verify_result',
                 attempt: data.attempt,
                 passed: data.passed,
+                stage: data.stage,
                 output: data.output,
               },
             ])
@@ -326,6 +418,7 @@ function App() {
           case 'file_fixing':
             lastAttemptRef.current = data.attempt
             setCurrentAttempt(data.attempt)
+            setExecutingStatus(`Fixing ${data.new_path} (attempt ${data.attempt})...`)
             setTimeline((prev) => [
               ...prev,
               { kind: 'fixing', newPath: data.new_path, attempt: data.attempt },
@@ -335,6 +428,7 @@ function App() {
           case 'file_fixed':
             lastAttemptRef.current = data.attempt
             setCurrentAttempt(data.attempt)
+            setExecutingStatus(`Fix applied to ${data.new_path} — re-running build...`)
             setTimeline((prev) => [
               ...prev,
               { kind: 'fixed', newPath: data.new_path, attempt: data.attempt },
@@ -358,13 +452,13 @@ function App() {
 
           case 'error': {
             errorShown = true
-            setErrorMessage(data.message)
-            setConnectionError(true)
+            showNotice(data.message)
             // The backend ends the stream right after an error event — close
             // so the browser does not auto-reconnect and re-run the migration.
             es.close()
             if (eventSourceRef.current === es) eventSourceRef.current = null
-            // No execution_complete is coming, so settle in-flight spinners.
+            // Stop here: the retry actions belong to the executing view, not
+            // the completion screen. Settle any in-flight spinners.
             const attempts = lastAttemptRef.current
             setFinalSummary((prev) => prev ?? { verified: false, attempts })
             break
@@ -375,14 +469,18 @@ function App() {
             const attempts = data.attempts ?? lastAttemptRef.current
             setFinalSummary({ verified, attempts })
 
-            // Fallback for the sandbox-setup-failure path, where no
-            // file_complete events are emitted.
+            // Apply per-file results: verification outcomes (pass/fail), the
+            // sandbox-setup-failure path (unverified) and the generation-phase
+            // split (generated vs generation_failed) all arrive here.
+            const generationFailed = data.results.some(
+              (r) => r.status === 'generation_failed',
+            )
             setFileStatuses((prev) => {
               const next = { ...prev }
               for (const r of data.results) {
                 next[r.file] = {
                   ...(next[r.file] ?? {}),
-                  status: r.status === 'pass' ? 'verified' : 'unverified',
+                  status: RESULT_STATUS_MAP[r.status] ?? 'unverified',
                 }
               }
               return next
@@ -390,6 +488,14 @@ function App() {
 
             es.close()
             eventSourceRef.current = null
+            if (generationFailed) {
+              // A generation failure normally ends on the earlier `error`
+              // event (which closes the stream first); if this completion is
+              // processed anyway, stay on the executing view so the
+              // "Retry failed files" actions remain available instead of
+              // mislabelling the run as a verification failure.
+              break
+            }
             setStage('complete')
             break
           }
@@ -398,7 +504,17 @@ function App() {
         // ignore malformed messages
       }
     }
-  }, [plan, closeConnection])
+  }, [plan, closeConnection, dismissNotice, showNotice])
+
+  /** Fresh run: wipe-and-regenerate (the backend's resume=false default). */
+  const handleRunMigration = useCallback(() => startMigration(false), [startMigration])
+
+  /**
+   * Retry after a run that ended with failed files or failed verification:
+   * a brand-new stream with ?resume=true, so only the missing files are
+   * generated and everything already on disk is reused.
+   */
+  const handleRetry = useCallback(() => startMigration(true), [startMigration])
 
   // ── Start Over ─────────────────────────────────────────────────────────
 
@@ -406,8 +522,7 @@ function App() {
     closeConnection()
     setStage('idle')
     setStatusMessage('')
-    setErrorMessage('')
-    setConnectionError(false)
+    dismissNotice()
     setPlan(null)
     setFileStatuses({})
     setExpandedCards({})
@@ -415,10 +530,22 @@ function App() {
     setVerificationStarted(false)
     setExpandedAttempts({})
     setFinalSummary(null)
+    setExecutingStatus('')
     lastAttemptRef.current = 0
     setCurrentAttempt(0)
     setRepoUrl(DEFAULT_REPO_URL)
-  }, [closeConnection])
+  }, [closeConnection, dismissNotice])
+
+  /**
+   * Recovery from an execution-phase error: go back to the plan review screen
+   * (the plan and the original URL are both still intact) so the user can
+   * explicitly re-run or start over. Never resubmits anything on its own.
+   */
+  const handleBackToPlan = useCallback(() => {
+    closeConnection()
+    dismissNotice()
+    setStage(plan ? 'review' : 'idle')
+  }, [closeConnection, dismissNotice, plan])
 
   const toggleOutput = useCallback((attempt: number) => {
     setExpandedAttempts((prev) => ({ ...prev, [attempt]: !prev[attempt] }))
@@ -455,6 +582,32 @@ function App() {
     (f) => fileStatuses[f.path]?.status !== 'pending' &&
       fileStatuses[f.path]?.status !== 'generating',
   ).length
+
+  // Files whose generation failed in the last run — exactly what a retry
+  // would regenerate (everything else is reused from disk).
+  const failedFileCount = sortedFiles.filter(
+    (f) => fileStatuses[f.path]?.status === 'gen_failed',
+  ).length
+  const retryLabel =
+    failedFileCount > 0 ? `Retry failed files (${failedFileCount})` : 'Retry verification'
+
+  // ── Final result summary ──────────────────────────────────────────────
+  // Rides in the same notice slot as every other banner, but never
+  // auto-dismisses: it stays until the user closes it or the stage changes.
+  useEffect(() => {
+    if (stage !== 'complete' || !finalSummary) return
+    if (finalSummary.verified) {
+      showNotice(
+        `All files verified after ${finalSummary.attempts} attempt${finalSummary.attempts === 1 ? '' : 's'}`,
+        { kind: 'success', autoDismiss: false, icon: '✓' },
+      )
+    } else {
+      showNotice(
+        `Verification failed after ${finalSummary.attempts} attempt${finalSummary.attempts === 1 ? '' : 's'} — manual review needed`,
+        { kind: 'error', autoDismiss: false, icon: '⚠' },
+      )
+    }
+  }, [stage, finalSummary, showNotice])
 
   // ── Shared sub-render: the file list (identical in Stage 4 and complete) ──
 
@@ -524,8 +677,13 @@ function App() {
    */
   const settledAttempts = new Set<number>()
   const settledFixes = new Set<string>()
+  // The build phase of an attempt is over once lint has started (or the
+  // result landed) — retires the "Verifying full build..." spinner so it
+  // can't keep spinning through the lint phase it no longer describes.
+  const buildSettled = new Set<number>()
   for (const row of timeline) {
     if (row.kind === 'verify_result') settledAttempts.add(row.attempt)
+    if (row.kind === 'lint_check' || row.kind === 'verify_result') buildSettled.add(row.attempt)
     if (row.kind === 'fixed') settledFixes.add(row.newPath)
   }
 
@@ -538,7 +696,7 @@ function App() {
       <section className="verify-panel">
         <div className="verify-panel-header">
           <h2 className="section-title">Build Verification</h2>
-          {stage !== 'complete' && !errorMessage && (
+          {stage !== 'complete' && !streamFinished && (
             <span className="verify-live">
               <span className="badge-spinner badge-spinner--dark" />
               In progress
@@ -546,7 +704,7 @@ function App() {
           )}
         </div>
         <p className="verify-panel-sub">
-          Full build is compiled in a sandbox after every file is generated. Failed
+          Each attempt runs a real build in a sandbox, then ESLint on the result. Failed
           attempts are retried with targeted fixes, up to 3 tries.
         </p>
 
@@ -560,6 +718,7 @@ function App() {
               isLast={i === timeline.length - 1}
               streamFinished={streamFinished}
               settledAttempts={settledAttempts}
+              buildSettled={buildSettled}
               settledFixes={settledFixes}
             />
           ))}
@@ -579,21 +738,16 @@ function App() {
       </header>
 
       <main className="main">
-        {/* ── Error Banner ── */}
-        {errorMessage && (
-          <div className="banner banner--error">
-            <span className="banner-icon">✕</span>
-            <span>{errorMessage}</span>
-            {(stage === 'planning' || stage === 'executing' || connectionError) && (
-              <button
-                className="banner-btn"
-                onClick={() => handleStartPlanning(DEFAULT_REPO_URL)}
-              >
-                Try Again
-              </button>
-            )}
-          </div>
-        )}
+        {/* ── Notice ── */}
+        {/* Every banner/note in the app renders here through the shared
+            notice mechanism: dismissible, auto-hiding after 5s (the final
+            summary excepted), and deliberately EMPTY of actions — "Retry
+            failed files", "Back to Plan" and "Start Over" live in the action
+            bars below, so closing a message never hides a button or changes
+            the stage. A planning error returns the user to Stage 1 with their
+            URL still in the (editable) input, so there is intentionally no
+            retry button here. */}
+        {notice && <Notice key={notice.id} notice={notice} onDismiss={dismissNotice} />}
 
         {/* ── Stage 1: Idle ── */}
         {stage === 'idle' && (
@@ -655,12 +809,15 @@ function App() {
         )}
 
         {/* ── Stage 2: Planning ── */}
-        {/* Once an error is shown the spinner is retired, so the UI never
-            keeps "Connecting to backend..." spinning beside the banner. */}
-        {stage === 'planning' && !errorMessage && (
+        {/* Persistent status line (NOT a notice): it is overwritten by every
+            progress/info event the backend sends (cloning → reading repo →
+            grounding → planning), so it always reflects the phase actually
+            running, and it is cleared only on plan_complete or error. An error
+            moves the user back to Stage 1, so no spinner outlives its process. */}
+        {stage === 'planning' && (
           <div className="planning">
             <div className="spinner" />
-            <p className="status-line">{statusMessage || 'Connecting...'}</p>
+            <p className="status-line">{statusMessage || 'Connecting to backend...'}</p>
           </div>
         )}
 
@@ -689,15 +846,33 @@ function App() {
         {/* ── Stage 4: Executing ── */}
         {stage === 'executing' && plan && (
           <div className="executing">
-            {/* Same as planning: once an error is shown, retire the spinner
-                so the UI isn't stuck loading behind the error banner. */}
-            {!errorMessage && (
+            {/* Recovery actions, shown once the stream has ended. They live
+                OUTSIDE the dismissible notice so they stay on screen after
+                the message is closed — dismissing a notice may only hide the
+                message, never the buttons. */}
+            {streamFinished && (
+              <div className="action-bar action-bar--top">
+                {failedFileCount > 0 && (
+                  <button className="btn btn--primary" onClick={handleRetry}>
+                    {retryLabel}
+                  </button>
+                )}
+                <button className="btn btn--secondary" onClick={handleBackToPlan}>
+                  Back to Plan
+                </button>
+              </div>
+            )}
+
+            {/* Once the stream is over the spinner is retired, so the UI can't
+                keep "Generating..." spinning behind the error notice. */}
+            {!streamFinished && (
               <div className="executing-status">
                 {verificationStarted ? (
                   <>
                     <div className="spinner" />
                     <span>
-                      Running build verification (attempt {currentAttempt || 1})...
+                      {executingStatus ||
+                        `Running build verification (attempt ${currentAttempt || 1})...`}
                     </span>
                   </>
                 ) : (
@@ -719,24 +894,18 @@ function App() {
         {/* ── Stage 4b: Complete ── */}
         {stage === 'complete' && (
           <div className="complete">
-            {finalSummary &&
-              (finalSummary.verified ? (
-                <div className="banner banner--success">
-                  <span className="banner-icon">✓</span>
-                  <span>
-                    All files verified after {finalSummary.attempts} attempt
-                    {finalSummary.attempts === 1 ? '' : 's'}
-                  </span>
-                </div>
-              ) : (
-                <div className="banner banner--error">
-                  <span className="banner-icon">⚠</span>
-                  <span>
-                    Verification failed after {finalSummary.attempts} attempt
-                    {finalSummary.attempts === 1 ? '' : 's'} — manual review needed
-                  </span>
-                </div>
-              ))}
+            {/* The verified/verification-failed summary renders up top through
+                the shared notice slot (working close button, no auto-hide). */}
+            {finalSummary && !finalSummary.verified && (
+              <div className="action-bar action-bar--top">
+                <button className="btn btn--primary" onClick={handleRetry}>
+                  {retryLabel}
+                </button>
+                <button className="btn btn--secondary" onClick={handleBackToPlan}>
+                  Back to Plan
+                </button>
+              </div>
+            )}
 
             {renderVerificationPanel()}
             {renderFileList()}
@@ -796,6 +965,7 @@ function TimelineRow({
   isLast,
   streamFinished,
   settledAttempts,
+  buildSettled,
   settledFixes,
 }: {
   row: TimelineEntry
@@ -804,6 +974,7 @@ function TimelineRow({
   isLast: boolean
   streamFinished: boolean
   settledAttempts: ReadonlySet<number>
+  buildSettled: ReadonlySet<number>
   settledFixes: ReadonlySet<string>
 }) {
   let dotClass = 'timeline-dot'
@@ -811,8 +982,9 @@ function TimelineRow({
 
   switch (row.kind) {
     case 'verify_start': {
-      // Spinner runs only until this attempt's verify_result lands.
-      const inFlight = !streamFinished && !settledAttempts.has(row.attempt)
+      // Spinner runs through the build only — it stops when lint starts or
+      // this attempt's verify_result lands, whichever comes first.
+      const inFlight = !streamFinished && !buildSettled.has(row.attempt)
       if (inFlight) dotClass += ' timeline-dot--active'
       body = (
         <div className="timeline-body">
@@ -828,30 +1000,48 @@ function TimelineRow({
       break
     }
 
+    case 'lint_check': {
+      // Settles as soon as this attempt's verify_result (which follows lint)
+      // lands, so the row never spins after the stream has moved on.
+      const inFlight = !streamFinished && !settledAttempts.has(row.attempt)
+      if (inFlight) dotClass += ' timeline-dot--active'
+      body = (
+        <div className="timeline-body">
+          <span className="timeline-text">{row.message}</span>
+          {inFlight && (
+            <span className="badge-spinner badge-spinner--dark timeline-inline-spinner" />
+          )}
+        </div>
+      )
+      break
+    }
+
     case 'verify_result':
       if (row.passed) {
         dotClass += ' timeline-dot--passed'
         body = (
           <div className="timeline-body">
             <span className="timeline-text timeline-text--passed">
-              Attempt {row.attempt} — Build passed
+              Attempt {row.attempt} — Build &amp; lint passed
             </span>
           </div>
         )
       } else {
+        const failedStage = row.stage === 'lint' ? 'Lint' : 'Build'
         dotClass += ' timeline-dot--failed'
         body = (
           <div className="timeline-body">
             <div className="timeline-body-head">
               <span className="timeline-text timeline-text--failed">
-                Attempt {row.attempt} — Build failed
+                Attempt {row.attempt} — {failedStage} failed
               </span>
               <button
                 className="output-toggle"
                 onClick={() => onToggleOutput(row.attempt)}
                 aria-expanded={outputOpen}
               >
-                {outputOpen ? '▾' : '▸'} {outputOpen ? 'Hide' : 'Show'} build output
+                {outputOpen ? '▾' : '▸'} {outputOpen ? 'Hide' : 'Show'}{' '}
+                {failedStage.toLowerCase()} output
                 {!outputOpen && row.output && (
                   <span className="output-size">
                     ({row.output.length.toLocaleString()} chars)

@@ -145,7 +145,7 @@ body {
   transform: none;
 }
 
-/* ── Banners ───────────────────────────────────────────────────────────── */
+/* ── Banners (shared Notice) ──────────────────────────────────────────── */
 .banner {
   display: flex;
   align-items: center;
@@ -155,6 +155,12 @@ body {
   font-size: 14px;
   font-weight: 500;
   margin-bottom: 24px;
+  transition: opacity 0.35s ease;
+}
+
+/* Smooth fade-out before the notice unmounts (auto-dismiss or close). */
+.banner.is-fading {
+  opacity: 0;
 }
 
 .banner--error {
@@ -175,27 +181,46 @@ body {
   color: #92400e;
 }
 
+.banner--info {
+  background: var(--color-accent-light);
+  border: 1px solid #c7d2fe;
+  color: #3730a3;
+}
+
 .banner-icon {
   font-size: 16px;
   flex-shrink: 0;
 }
 
-.banner-btn {
-  margin-left: auto;
-  padding: 6px 16px;
-  font-size: 13px;
-  font-weight: 600;
-  background: #fff;
-  border: 1px solid var(--color-error-border);
-  border-radius: var(--radius-sm);
-  color: #991b1b;
-  cursor: pointer;
-  font-family: var(--font-sans);
-  transition: background 0.15s;
+.banner-message {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
 }
 
-.banner-btn:hover {
-  background: #fef2f2;
+/* Working dismiss button — hides the message only, never any action button. */
+.banner-close {
+  flex-shrink: 0;
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.banner-close:hover {
+  background: rgba(0, 0, 0, 0.06);
+  border-color: currentColor;
 }
 
 /* ── Idle Stage ────────────────────────────────────────────────────────── */
@@ -250,13 +275,19 @@ body {
   color: var(--color-pending);
 }
 
+/* Hover feedback — must not override the invalid (red) border below. */
+.repo-input:hover {
+  border-color: #cbd5e1;
+}
+
 .repo-input:focus {
   outline: none;
   border-color: var(--color-accent);
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
 }
 
-.repo-input--invalid {
+.repo-input--invalid,
+.repo-input--invalid:hover {
   border-color: var(--color-error);
 }
 
@@ -628,6 +659,12 @@ body {
   flex-wrap: wrap;
   gap: 12px;
   padding: 28px 0 0;
+}
+
+/* Recovery actions rendered directly under a notice — kept tight to the top
+   of their section so they are visible right after the message is closed. */
+.action-bar--top {
+  padding: 0 0 24px;
 }
 
 /* ── Review / Executing / Complete wrapper spacing ─────────────────────── */

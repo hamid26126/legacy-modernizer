@@ -157,6 +157,31 @@ def guess_broken_file(build_output: str, file_paths: list) -> str | None:
     return js_files[0] if js_files else (file_paths[0] if file_paths else None)
 
 
+def guess_broken_files(failure_output: str, file_paths: list) -> list:
+    """
+    EVERY migrated file the failure output names, ordered by where it appears
+    (guess_broken_file only ever returns the first one). Lets a single fix
+    pass repair every file the build/linter flagged instead of one per attempt.
+
+    A file is only included when its block of the output contains an `error`
+    finding — eslint prints warning-only files too, and warnings don't fail
+    verification, so rewriting those files is wasted risk.
+    """
+    matches = []
+    for path in file_paths:
+        idx = failure_output.find(path.split("/")[-1])
+        if idx != -1:
+            matches.append((idx, path))
+    matches.sort()
+
+    flagged = []
+    for i, (idx, path) in enumerate(matches):
+        end = matches[i + 1][0] if i + 1 < len(matches) else len(failure_output)
+        if re.search(r"\berror\b", failure_output[idx:end], re.IGNORECASE):
+            flagged.append(path)
+    return flagged
+
+
 def classify_build_error(build_output: str) -> str:
     lowered = build_output.lower()
     if "failed to resolve import" in lowered or "could not resolve" in lowered or "cannot find module" in lowered:

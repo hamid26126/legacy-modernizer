@@ -11,9 +11,17 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()
 
+# timeout=45 bounds every model call: without it the SDK falls back to its
+# default 600s (10 min) per request, which is where multi-minute planning
+# hangs came from. max_retries=0 disables the SDK's own internal retries so
+# ALL retrying is done by call_with_retry below (retries=2, delay=2) — that
+# makes the worst case a single model call exactly 3 x 45s + 2 x 2s = 139s,
+# instead of 3 outer attempts x 3 SDK retries x 45s = ~6.75 minutes.
 client = OpenAI(
     api_key=os.environ["NEBIUS_API_KEY"],
     base_url="https://api.tokenfactory.nebius.com/v1/",
+    timeout=45.0,
+    max_retries=0,
 )
 tavily = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
@@ -35,8 +43,22 @@ def read_repo(repo_path: Path) -> str:
 
 
 def ground_with_tavily(query: str) -> str:
-    """Pull current migration guidance so the plan isn't based on stale training data."""
-    results = call_with_retry(tavily.search, query, max_results=3, search_depth="basic")
+    """Pull current migration guidance so the plan isn't based on stale training data.
+
+    TavilyClient's constructor in the installed tavily-python 0.8.4 has no
+    timeout parameter, so the stall is bounded at the call site instead: a
+    per-request timeout=20 (supported by .search in this version) plus
+    retries=1/delay=2 — 2 attempts max, worst case 2 x 20s + 2s = 42s,
+    rather than the default 60s per request compounded by 3 default retries."""
+    results = call_with_retry(
+        tavily.search,
+        query,
+        max_results=3,
+        search_depth="basic",
+        timeout=20,
+        retries=1,
+        delay=2,
+    )
     snippets = []
     for r in results.get("results", []):
         snippets.append(f"Source: {r['url']}\n{r['content'][:500]}")

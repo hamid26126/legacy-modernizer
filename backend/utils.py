@@ -1,4 +1,6 @@
+import os
 import time
+import json
 import hashlib
 from pathlib import Path
 
@@ -101,10 +103,72 @@ def get_plan_cache_path(repo_path: Path, cache_key: str | None = None) -> Path:
     """Each cloned repo gets its own cache file, keyed by its resolved path,
     so two different repos never collide on a single shared cache file.
     Pass cache_key (e.g. the GitHub URL) to make the key stable across clones —
-    otherwise a fresh temp dir per clone would produce a fresh cache miss."""
+    otherwise a fresh temp dir per clone would produce a fresh cache miss.
+
+    Cache files live in backend/.cache/, NOT directly in backend/: anything
+    written inside the backend/ tree can be picked up by uvicorn's --reload
+    file watcher, which restarts the server and kills in-flight SSE requests."""
     key_source = cache_key if cache_key else str(Path(repo_path).resolve())
     key = hashlib.sha256(key_source.encode()).hexdigest()[:16]
-    return Path(__file__).parent / f"plan_cache_{key}.json"
+    cache_dir = Path(__file__).parent / ".cache"
+    cache_dir.mkdir(exist_ok=True)
+    return cache_dir / f"plan_cache_{key}.json"
+
+
+def get_generation_state_path(repo_path: Path, cache_key: str | None = None) -> Path:
+    """Path of the generation-progress state file for one migration run.
+
+    Same keying as get_plan_cache_path (so plan cache and generation state for
+    the same repo/URL always pair up), but a generation_<hash>.json name.
+    Lives in backend/.cache/ for the same uvicorn --reload reason documented
+    on get_plan_cache_path: nothing written during a request may sit in the
+    watched backend/ tree."""
+    key_source = cache_key if cache_key else str(Path(repo_path).resolve())
+    key = hashlib.sha256(key_source.encode()).hexdigest()[:16]
+    cache_dir = Path(__file__).parent / ".cache"
+    cache_dir.mkdir(exist_ok=True)
+    return cache_dir / f"generation_{key}.json"
+
+
+def plan_fingerprint(plan: dict) -> str:
+    """Stable sha256 of a plan's content. Used to detect that the plan changed
+    between a failed run and a resumed run — a resume must never reuse output
+    generated from a *different* plan."""
+    return hashlib.sha256(json.dumps(plan, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def load_generation_state(state_path: Path) -> dict | None:
+    """Read a generation state file. Returns None when the file is missing or
+    unreadable/corrupt — the caller then falls back to a fresh run rather than
+    trusting half-written state."""
+    try:
+        data = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("plan_fingerprint"), str):
+        return None
+    generated = data.get("generated")
+    if not isinstance(generated, list):
+        generated = []
+    return {"plan_fingerprint": data["plan_fingerprint"], "generated": [p for p in generated if isinstance(p, str)]}
+
+
+def save_generation_state(state_path: Path, state: dict) -> None:
+    """Persist generation progress. Written via a temp file + os.replace so a
+    crash mid-write can never leave a truncated JSON file behind (the next run
+    would then treat it as corrupt and silently regenerate everything)."""
+    import os
+    state_path = Path(state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        {"plan_fingerprint": state.get("plan_fingerprint", ""), "generated": state.get("generated", [])},
+        indent=2,
+    )
+    tmp_path = state_path.with_name(state_path.name + ".tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    os.replace(tmp_path, state_path)
 
 
 def dedupe_plan_paths(plan: dict) -> dict:
@@ -151,4 +215,19 @@ def ensure_core_files_present(plan: dict, migratable_files: list) -> dict:
                     "following the same conventions as other files in this migration."
                 ),
             })
+            planned_paths.add(rel_path)
+
+    # Same safety net for the HTML entry point: without an index.html the plan
+    # has no entry document for the migrated app at all.
+    for rel_path in migratable_files:
+        if rel_path.endswith(".html") and rel_path not in planned_paths:
+            max_priority += 1
+            plan.setdefault("files", []).append({
+                "path": rel_path,
+                "new_path": "index.html",
+                "priority": max_priority,
+                "depends_on": [],
+                "migration_notes": "Recovered — this file was omitted from the original plan.",
+            })
+            planned_paths.add(rel_path)
     return plan

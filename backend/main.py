@@ -1,3 +1,23 @@
+"""
+Legacy Modernization Agent API.
+
+RUNNING WITH --reload (use this for any real testing/demo):
+
+    uvicorn main:app --reload --port 8000 --reload-include "*.py"
+
+The --reload-include "*.py" flag is NOT optional when --reload is used: it
+restricts the watcher to Python sources so that files written during a
+request (plan-cache JSON in backend/.cache/, __pycache__, logs) can never
+restart the server mid-request and kill an in-flight SSE stream. Plan cache
+files are additionally kept out of the watched tree in backend/.cache/ as a
+second layer. If you need to change backend code, restart the server rather
+than relying on a mid-flight reload.
+
+Caveat: --reload-include only takes effect when the `watchfiles` package is
+installed. Without it uvicorn falls back to StatReload, which polls only
+*.py files anyway (and logs a warning that the flag had no effect) — so
+neither flavour of reload should react to JSON/cache writes.
+"""
 import io
 import json
 import queue
@@ -83,11 +103,15 @@ async def stream_plan(repo_url: str, force_refresh: bool = False):
         if _last_repo_path is not None:
             cleanup_repo(_last_repo_path)
             _last_repo_path = None
+        # Sent before the (blocking) clone so the UI can show a real status
+        # line instead of sitting on a generic "connecting" message.
+        yield {"type": "progress", "step": "cloning", "message": "Cloning repository — this may take a minute..."}
         try:
             repo_path = clone_repo(repo_url)
         except RepoFetchError as e:
             yield {"type": "error", "message": str(e)}
             return
+        yield {"type": "progress", "step": "cloned", "message": "Clone complete — analyzing codebase..."}
         _last_repo_path = repo_path
         _last_repo_url = repo_url
         yield from get_migration_plan_stream(repo_path, force_refresh, cache_key=repo_url)
@@ -97,12 +121,20 @@ async def stream_plan(repo_url: str, force_refresh: bool = False):
 
 
 @app.get("/api/migrate/stream")
-async def stream_migrate():
+async def stream_migrate(resume: bool = False):
+    """Stream a migration run.
+
+    resume=true reuses the output of a previous run for this same plan: files
+    already generated are read back from disk instead of being regenerated,
+    and only the missing/failed ones are sent to the model. output/ is only
+    wiped when the saved progress doesn't match the current plan."""
     if _last_repo_path is None:
         async def error_gen():
             yield sse_format({"type": "error", "message": "No repo has been planned yet. Call /api/plan/stream first."})
         return StreamingResponse(error_gen(), media_type="text/event-stream")
-    gen = stream_generator_in_thread(lambda: execute_plan_stream(_last_repo_path, cache_key=_last_repo_url))
+    gen = stream_generator_in_thread(
+        lambda: execute_plan_stream(_last_repo_path, cache_key=_last_repo_url, resume=resume)
+    )
     return StreamingResponse(gen, media_type="text/event-stream")
 
 
