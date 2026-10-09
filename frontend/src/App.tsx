@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { useNotice } from './useNotice'
 import { Notice } from './Notice'
+import { API_BASE } from './config'
 import './App.css'
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -153,6 +154,10 @@ function App() {
   const [fileStatuses, setFileStatuses] = useState<Record<string, FileStatusEntry>>({})
   const [expandedCards, setExpandedCards] = useState<Record<number, boolean>>({})
   const [repoUrl, setRepoUrl] = useState(DEFAULT_REPO_URL)
+  // Job id issued by the backend right after a successful clone. Required by
+  // /api/migrate/stream and /api/download/zip so simultaneous users never
+  // touch each other's clone/output. Dropped on Start Over.
+  const [jobId, setJobId] = useState<string | null>(null)
 
   // Verification timeline state
   const [timeline, setTimeline] = useState<TimelineEntry[]>([])
@@ -193,6 +198,9 @@ function App() {
     setStatusMessage('Connecting to backend...')
     dismissNotice()
     setPlan(null)
+    // The new plan will mint a fresh job_id; drop any previous one so a
+    // migrate/download can never target the old session.
+    setJobId(null)
     setFileStatuses({})
     setExpandedCards({})
     setTimeline([])
@@ -206,7 +214,7 @@ function App() {
     // repo_url is a required query param on the backend, and must be encoded
     // since it is itself a URL.
     const es = new EventSource(
-      `http://localhost:8000/api/plan/stream?repo_url=${encodeURIComponent(repo)}`,
+      `${API_BASE}/api/plan/stream?repo_url=${encodeURIComponent(repo)}`,
     )
     eventSourceRef.current = es
 
@@ -235,12 +243,18 @@ function App() {
           | { type: 'info'; message: string }
           | { type: 'progress'; step: string; message: string }
           | { type: 'error'; message: string }
+          | { type: 'job'; job_id: string }
           | { type: 'plan_complete'; plan: Plan }
 
         switch (data.type) {
           case 'info':
           case 'progress':
             setStatusMessage(data.message)
+            break
+          case 'job':
+            // Sent by the backend right after a successful clone, before any
+            // planning events — store it for migrate + download.
+            setJobId(data.job_id)
             break
           case 'error':
             errorShown = true
@@ -276,7 +290,7 @@ function App() {
    * instead of being reset.
    */
   const startMigration = useCallback((resume: boolean) => {
-    if (!plan) return
+    if (!plan || !jobId) return
 
     /**
      * Generation-phase errors arrive keyed by the original path, but errors
@@ -316,9 +330,11 @@ function App() {
       return next
     })
 
-    const es = new EventSource(
-      `http://localhost:8000/api/migrate/stream${resume ? '?resume=true' : ''}`,
-    )
+    // job_id is required by the backend (it scopes the clone + output dir
+    // to this session); resume retries reuse the SAME job.
+    const params = new URLSearchParams({ job_id: jobId })
+    if (resume) params.set('resume', 'true')
+    const es = new EventSource(`${API_BASE}/api/migrate/stream?${params.toString()}`)
     eventSourceRef.current = es
 
     // True once a backend-sent {"type": "error"} has been shown for THIS
@@ -504,7 +520,7 @@ function App() {
         // ignore malformed messages
       }
     }
-  }, [plan, closeConnection, dismissNotice, showNotice])
+  }, [plan, jobId, closeConnection, dismissNotice, showNotice])
 
   /** Fresh run: wipe-and-regenerate (the backend's resume=false default). */
   const handleRunMigration = useCallback(() => startMigration(false), [startMigration])
@@ -534,6 +550,9 @@ function App() {
     lastAttemptRef.current = 0
     setCurrentAttempt(0)
     setRepoUrl(DEFAULT_REPO_URL)
+    // This session is over: forget the job so nothing can download or resume
+    // into the previous run's output.
+    setJobId(null)
   }, [closeConnection, dismissNotice])
 
   /**
@@ -554,16 +573,18 @@ function App() {
   /**
    * Hand the download off to the browser. The endpoint responds with
    * Content-Disposition: attachment, so this triggers a save dialog even
-   * though the backend is on a different origin.
+   * though the backend is on a different origin. job_id scopes the zip to
+   * THIS session's output directory.
    */
   const handleDownload = useCallback(() => {
+    if (!jobId) return
     const a = document.createElement('a')
-    a.href = 'http://localhost:8000/api/download/zip'
+    a.href = `${API_BASE}/api/download/zip?job_id=${encodeURIComponent(jobId)}`
     a.download = 'migrated-app.zip'
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
-  }, [])
+  }, [jobId])
 
   const toggleCard = useCallback((idx: number) => {
     setExpandedCards((prev) => ({ ...prev, [idx]: !prev[idx] }))

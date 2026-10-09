@@ -1,0 +1,17 @@
+# Secrets — never bake an .env into the image.
+.env
+**/.env
+
+# Local virtualenv / deps
+.venv
+node_modules
+
+# Not needed inside the image
+frontend
+test-repos
+output
+.git
+__pycache__
+**/__pycache__
+backend/.cache
+*.md

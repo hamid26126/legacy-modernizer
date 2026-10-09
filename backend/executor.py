@@ -306,7 +306,22 @@ def fix_file_with_build_error(original_path, new_path, current_content, notes, b
     return raw
 
 
-def execute_plan_stream(repo_path: Path, cache_key: str | None = None, resume: bool = False):
+def execute_plan_stream(
+    repo_path: Path,
+    cache_key: str | None = None,
+    resume: bool = False,
+    output_path: Path | None = None,
+):
+    """Generate the migrated files for one plan.
+
+    output_path selects where generated files land. The API passes a
+    per-job directory (output/<job_id>) so simultaneous users never write
+    into the same place; None (CLI and older callers) uses the shared
+    OUTPUT_PATH exactly as before. The generation-state file is keyed by
+    repo_path — unique per clone/job — so jobs can never collide on it,
+    even when two jobs migrate the same repo URL (shared plan cache).
+    """
+    out: Path = OUTPUT_PATH if output_path is None else Path(output_path)
     try:
         plan = load_plan(repo_path, cache_key)
     except Exception as e:
@@ -329,15 +344,15 @@ def execute_plan_stream(repo_path: Path, cache_key: str | None = None, resume: b
             state = previous
 
     if resumed:
-        # Keep output/: files already generated stay on disk and are reused by
-        # the loop below instead of being paid for again.
-        OUTPUT_PATH.mkdir(exist_ok=True)
+        # Keep the output dir: files already generated stay on disk and are
+        # reused by the loop below instead of being paid for again.
+        out.mkdir(parents=True, exist_ok=True)
     else:
-        # Wipe output/ so a new migration never inherits files (or stale
-        # _unused_ placeholders) from a previous run, and reset the progress
-        # state file for this fresh run.
-        shutil.rmtree(OUTPUT_PATH, ignore_errors=True)
-        OUTPUT_PATH.mkdir(exist_ok=True)
+        # Wipe the output dir so a new migration never inherits files (or
+        # stale _unused_ placeholders) from a previous run, and reset the
+        # progress state file for this fresh run.
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True, exist_ok=True)
         save_generation_state(state_path, state)
 
     generated_set = set(state["generated"])
@@ -378,7 +393,7 @@ def execute_plan_stream(repo_path: Path, cache_key: str | None = None, resume: b
         # index.html is always rebuilt deterministically and _unused_
         # placeholders are always rewritten, exactly as in a fresh run.
         if resumed and not is_placeholder and not is_index and new_path in generated_set:
-            output_file = OUTPUT_PATH / new_path
+            output_file = out / new_path
             existing = None
             if output_file.is_file():
                 try:
@@ -394,7 +409,7 @@ def execute_plan_stream(repo_path: Path, cache_key: str | None = None, resume: b
 
         yield {"type": "file_start", "file": original_path, "new_path": new_path}
         if is_placeholder:
-            output_file = OUTPUT_PATH / new_path
+            output_file = out / new_path
             output_file.parent.mkdir(parents=True, exist_ok=True)
             output_file.write_text(f"// Not migrated separately — see src/App.jsx\n", encoding="utf-8")
             record_generated(new_path)
@@ -416,7 +431,7 @@ def execute_plan_stream(repo_path: Path, cache_key: str | None = None, resume: b
                 content = call_with_retry(migrate_file, original_path, new_path, notes, original_content, html_reference, retries=1)
 
             migrated[new_path] = content
-            output_file = OUTPUT_PATH / new_path
+            output_file = out / new_path
             output_file.parent.mkdir(parents=True, exist_ok=True)
             output_file.write_text(content, encoding="utf-8")
             record_generated(new_path)
@@ -490,7 +505,7 @@ def execute_plan_stream(repo_path: Path, cache_key: str | None = None, resume: b
                 if introduces_new_relative_import(migrated[broken], fixed):
                     yield {"type": "info", "message": f"Warning: the fix for {broken} still imports a file that does not exist in this project — the build may fail again."}
                 migrated[broken] = fixed
-                (OUTPUT_PATH / broken).write_text(fixed, encoding="utf-8")
+                (out / broken).write_text(fixed, encoding="utf-8")
                 yield {"type": "file_fixed", "new_path": broken, "attempt": next_attempt}
                 fixed_any = True
             except Exception as e:

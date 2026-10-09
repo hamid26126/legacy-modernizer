@@ -1,1 +1,0 @@
-// Not migrated separately — see src/App.jsx

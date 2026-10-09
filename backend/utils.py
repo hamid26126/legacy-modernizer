@@ -111,22 +111,27 @@ def get_plan_cache_path(repo_path: Path, cache_key: str | None = None) -> Path:
     key_source = cache_key if cache_key else str(Path(repo_path).resolve())
     key = hashlib.sha256(key_source.encode()).hexdigest()[:16]
     cache_dir = Path(__file__).parent / ".cache"
-    cache_dir.mkdir(exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / f"plan_cache_{key}.json"
 
 
 def get_generation_state_path(repo_path: Path, cache_key: str | None = None) -> Path:
     """Path of the generation-progress state file for one migration run.
 
-    Same keying as get_plan_cache_path (so plan cache and generation state for
-    the same repo/URL always pair up), but a generation_<hash>.json name.
-    Lives in backend/.cache/ for the same uvicorn --reload reason documented
-    on get_plan_cache_path: nothing written during a request may sit in the
-    watched backend/ tree."""
-    key_source = cache_key if cache_key else str(Path(repo_path).resolve())
-    key = hashlib.sha256(key_source.encode()).hexdigest()[:16]
+    Keyed ONLY by the resolved repo_path — never by cache_key. Every clone
+    lands in its own fresh temp directory (repo_fetch.clone_repo uses
+    mkdtemp per attempt), so repo_path is unique per job/session; keying by
+    it guarantees two simultaneous jobs cannot collide on progress state,
+    even when they migrate the SAME repo URL (the plan cache is deliberately
+    shared by URL, the generation state must not be).
+
+    cache_key is accepted for call-site compatibility and intentionally
+    ignored. Lives in backend/.cache/ for the same uvicorn --reload reason
+    documented on get_plan_cache_path: nothing written during a request may
+    sit in the watched backend/ tree."""
+    key = hashlib.sha256(str(Path(repo_path).resolve()).encode()).hexdigest()[:16]
     cache_dir = Path(__file__).parent / ".cache"
-    cache_dir.mkdir(exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / f"generation_{key}.json"
 
 

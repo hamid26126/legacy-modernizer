@@ -517,11 +517,58 @@ class TimeoutConfigTest(unittest.TestCase):
         self.assertFalse(events_of(events, "execution_complete")[0]["verified"])
 
 
-# ── main.py resume pass-through ───────────────────────────────────────────
+# ── main.py job pass-through ──────────────────────────────────────────────
 
-class MainResumeParamTest(unittest.TestCase):
-    def test_stream_migrate_forwards_resume_and_cache_key(self):
+class MainJobParamTest(unittest.TestCase):
+    """stream_migrate is scoped by job_id: the job's repo_path/repo_url/
+    output_dir are forwarded to execute_plan_stream, and an unknown or
+    expired job_id yields the expired-session error event."""
+
+    def setUp(self):
         import main
+
+        self.main = main
+        self.request = _make_request()
+
+        # Isolate the shared job table, job output base and cost state.
+        self._saved_jobs = dict(main._jobs)
+        main._jobs.clear()
+        self.addCleanup(self._restore_jobs)
+        temp_base = Path(tempfile.mkdtemp(prefix="legacy-modernizer-jobs-"))
+        self._saved_output_base = main.BASE_OUTPUT_DIR
+        main.BASE_OUTPUT_DIR = temp_base
+        self.addCleanup(setattr, main, "BASE_OUTPUT_DIR", self._saved_output_base)
+        self.addCleanup(shutil.rmtree, temp_base, True)
+        self._saved_limits = (
+            main._migration_limiter,
+            main._daily_cap,
+            main._migrate_semaphore,
+        )
+        main._migration_limiter = main.SlidingWindowLimiter(0)
+        main._daily_cap = main.DailyCounter(0)
+        main._migrate_semaphore = main._UnlimitedSemaphore()
+
+        def restore_limits():
+            (
+                main._migration_limiter,
+                main._daily_cap,
+                main._migrate_semaphore,
+            ) = self._saved_limits
+
+        self.addCleanup(restore_limits)
+
+    def _restore_jobs(self):
+        self.main._jobs.clear()
+        self.main._jobs.update(self._saved_jobs)
+
+    def _register_job(self):
+        return self.main._create_job(
+            repo_path=Path("C:/tmp/some-repo"),
+            repo_url="https://github.com/example/repo",
+        )
+
+    def test_stream_migrate_forwards_job_resume_and_output_path(self):
+        main = self.main
 
         captured = {}
         calls = []
@@ -538,31 +585,74 @@ class MainResumeParamTest(unittest.TestCase):
             calls.append((args, kwargs))
             return iter([])
 
-        previous_repo = main._last_repo_path
-        previous_url = main._last_repo_url
+        job = self._register_job()
         try:
-            main._last_repo_path = Path("C:/tmp/some-repo")
-            main._last_repo_url = "https://github.com/example/repo"
             with mock.patch.object(main, "stream_generator_in_thread", side_effect=fake_stream_generator_in_thread), \
                     mock.patch.object(main, "execute_plan_stream", side_effect=fake_execute_plan_stream):
-                asyncio.run(main.stream_migrate(resume=True))
+                asyncio.run(main.stream_migrate(request=self.request, job_id=job["job_id"], resume=True))
                 self.assertIn("gen_func", captured)
-                captured["gen_func"]()
+                list(captured["gen_func"]())
 
                 captured.clear()
-                asyncio.run(main.stream_migrate())
-                captured["gen_func"]()
+                asyncio.run(main.stream_migrate(request=self.request, job_id=job["job_id"]))
+                self.assertIn("gen_func", captured)
+                list(captured["gen_func"]())
         finally:
-            main._last_repo_path = previous_repo
-            main._last_repo_url = previous_url
+            main._jobs.pop(job["job_id"], None)
 
         self.assertEqual(len(calls), 2)
-        _, resumed_kwargs = calls[0]
+        resumed_args, resumed_kwargs = calls[0]
+        self.assertEqual(resumed_args[0], job["repo_path"])
         self.assertIs(resumed_kwargs["resume"], True)
         self.assertEqual(resumed_kwargs["cache_key"], "https://github.com/example/repo")
-        _, fresh_kwargs = calls[1]
+        self.assertEqual(resumed_kwargs["output_path"], job["output_dir"])
+        fresh_args, fresh_kwargs = calls[1]
+        self.assertEqual(fresh_args[0], job["repo_path"])
         self.assertIs(fresh_kwargs["resume"], False)
-        self.assertEqual(fresh_kwargs["cache_key"], "https://github.com/example/repo")
+        self.assertEqual(fresh_kwargs["output_path"], job["output_dir"])
+
+    def test_unknown_job_id_emits_expired_session_error(self):
+        import main
+
+        response = asyncio.run(
+            main.stream_migrate(request=self.request, job_id="does-not-exist", resume=True)
+        )
+        events = _read_sse_events(response)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "error")
+        self.assertEqual(events[0]["message"], main.EXPIRED_SESSION_MESSAGE)
+
+
+def _make_request():
+    from fastapi import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/migrate/stream",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 40000),
+            "server": ("testserver", 80),
+        }
+    )
+
+
+def _read_sse_events(response):
+    """Drain a StreamingResponse body and parse its SSE data payloads."""
+    async def collect():
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
+        return "".join(chunks)
+
+    text = asyncio.run(collect())
+    events = []
+    for line in text.splitlines():
+        if line.startswith("data: "):
+            events.append(json.loads(line[len("data: "):]))
+    return events
 
 
 if __name__ == "__main__":
