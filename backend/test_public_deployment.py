@@ -770,5 +770,60 @@ class SecretsHygieneTest(unittest.TestCase):
             self.assertNotIn("traceback.", source, name)
 
 
+# ── 6c. Health endpoint (keep-awake ping) ──────────────────────────────────
+
+class HealthEndpointTest(JobsTableMixin, unittest.TestCase):
+    """/api/health is what the scheduled keep-awake workflow and the frontend's
+    cold-start poll hit. It must stay a bare status reply: no rate-limit
+    budget spent, no job lookup/cleanup, no clone/plan/migration/sandbox work,
+    so it can be called every few minutes indefinitely."""
+
+    def test_health_returns_ok_without_touching_limits_jobs_or_work(self):
+        from fastapi.testclient import TestClient
+
+        ip = "203.0.113.42"
+        jobs_before = dict(main._jobs)
+        plan_used_before = main._plan_limiter.used(ip)
+        migration_used_before = main._migration_limiter.used(ip)
+        daily_before = main._daily_cap._count
+        slots_before = getattr(main._migrate_semaphore, "_value", None)
+
+        client = TestClient(main.app)
+        with mock.patch.object(main, "clone_repo") as clone, \
+                mock.patch.object(main, "get_migration_plan_stream") as plan, \
+                mock.patch.object(main, "execute_plan_stream") as run:
+            response = None
+            # Far more hits than the per-hour plan limit would ever allow.
+            for _ in range(25):
+                response = client.get("/api/health", headers={"x-forwarded-for": ip})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+        # No clone, no planning, no migration (and therefore no model/sandbox).
+        clone.assert_not_called()
+        plan.assert_not_called()
+        run.assert_not_called()
+
+        # Rate limiters, daily budget and concurrency slots stay untouched.
+        self.assertEqual(main._plan_limiter.used(ip), plan_used_before)
+        self.assertEqual(main._migration_limiter.used(ip), migration_used_before)
+        self.assertEqual(main._daily_cap._count, daily_before)
+        self.assertEqual(getattr(main._migrate_semaphore, "_value", None), slots_before)
+
+        # The job table is neither read nor written (no TTL sweep either).
+        self.assertEqual(dict(main._jobs), jobs_before)
+
+    def test_health_handler_source_mentions_no_limits_jobs_or_work(self):
+        import inspect
+
+        source = inspect.getsource(main.health)
+        for forbidden in (
+            "limiter", "_jobs", "cleanup_expired", "clone_repo",
+            "execute_plan", "sandbox", "OpenAI", "client_ip",
+        ):
+            self.assertNotIn(forbidden, source, forbidden)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

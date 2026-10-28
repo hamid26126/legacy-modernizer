@@ -352,6 +352,33 @@ body {
   flex-shrink: 0;
 }
 
+/* ── Wake-up line (cold Render instance) ──────────────────────────────────── */
+/* Sits directly under the header and stays until /api/health answers. Not a
+   Notice/banner: those live in the notice slot and auto-dismiss. */
+.wake-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--color-accent-light);
+  border-bottom: 1px solid var(--color-border);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text);
+  text-align: center;
+}
+
+.wake-status-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
 /* ── Section Title ─────────────────────────────────────────────────────── */
 .section-title {
   font-size: 18px;

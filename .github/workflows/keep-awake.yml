@@ -1,0 +1,36 @@
+# Keeps the Render backend from sleeping.
+#
+# Render's free tier parks the service after ~15 min of no traffic and needs
+# ~1 min to boot again, so this pings /api/health every 10 minutes. The ping
+# is a plain GET: the endpoint holds no rate limits, no job lookup and no
+# model/sandbox work (backend/main.py), so it is safe to hit on a schedule.
+#
+# Configure a repository variable BACKEND_URL (e.g. https://your-app.onrender.com)
+# for this to do anything; with it unset the job exits 0 as a no-op. A curl
+# failure (sleeping host, network blip) must never mark the workflow failed.
+name: Keep backend awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping backend health endpoint
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+        run: |
+          # Trim whitespace, then bail out cleanly when the variable is unset.
+          backend_url="$(printf '%s' "$BACKEND_URL" | tr -d '[:space:]')"
+          if [ -z "$backend_url" ]; then
+            echo "BACKEND_URL is not configured — nothing to ping."
+            exit 0
+          fi
+          echo "Pinging ${backend_url}/api/health"
+          # --max-time 60 bounds a cold start (~1 min to wake); || true keeps a
+          # slow or dead host from ever failing the run.
+          curl --fail --silent --show-error --max-time 60 "${backend_url}/api/health" || true

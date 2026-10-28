@@ -112,6 +112,24 @@ const DEFAULT_REPO_URL = 'https://github.com/coryjquirk/weather-dashboard'
 /** Backend accepts only github.com hosts (repo_fetch.validate_github_url). */
 const REPO_URL_PREFIX = 'https://github.com/'
 
+/**
+ * Cold-start probe for a sleeping host (Render sleeps after ~15 min idle and
+ * needs ~1 min to boot). On mount we poll /api/health every 3s, capping each
+ * try at 8s so one hung request can't eat the whole budget, until it answers
+ * or 120s have passed.
+ */
+const HEALTH_POLL_INTERVAL_MS = 3000
+const HEALTH_TRY_TIMEOUT_MS = 8000
+/** The wake-up line waits 2s first — a warm server answers before that. */
+const HEALTH_WAKE_DELAY_MS = 2000
+const HEALTH_GIVE_UP_MS = 120000
+
+const WAKE_MESSAGE = 'Waking up the server. The first visit can take up to a minute.'
+const WAKE_FAILED_MESSAGE = 'Could not reach the server. Please refresh and try again.'
+
+/** Lifecycle of the on-mount health probe. */
+type HealthState = 'pending' | 'waking' | 'ready' | 'failed'
+
 const CARD_STATUS_CLASS: Record<FileStatus, string> = {
   pending: 'pending',
   generating: 'generating',
@@ -169,6 +187,9 @@ function App() {
   // header text never goes stale while a different phase is actually running.
   const [executingStatus, setExecutingStatus] = useState('')
 
+  // On-mount health probe: 'pending' → ('waking' →) 'ready', or 'failed'.
+  const [healthState, setHealthState] = useState<HealthState>('pending')
+
   const eventSourceRef = useRef<EventSource | null>(null)
   const lastAttemptRef = useRef(0)
 
@@ -182,6 +203,87 @@ function App() {
   useEffect(() => {
     return () => closeConnection()
   }, [closeConnection])
+
+  // ── Backend wake-up check ────────────────────────────────────────────────
+
+  /**
+   * Poll /api/health until it answers or HEALTH_GIVE_UP_MS elapse.
+   *
+   * The "waking" message and the disabled button only kick in after 2s, so a
+   * warm server (or a local dev server) never shows them at all. Success
+   * lands in 'ready' from any state and drops the message; the 120s deadline
+   * lands in 'failed', which re-enables the button and raises a notice.
+   * StrictMode's dev double-mount is neutralised by the `cancelled` flag.
+   */
+  useEffect(() => {
+    let cancelled = false
+    let retryTimer: number | undefined
+    const startedAt = Date.now()
+
+    const giveUp = () => {
+      if (!cancelled) setHealthState('failed')
+    }
+
+    const tryOnce = async (): Promise<void> => {
+      if (cancelled) return
+      const attemptAt = Date.now()
+      if (attemptAt - startedAt >= HEALTH_GIVE_UP_MS) {
+        giveUp()
+        return
+      }
+
+      // Per-try cap: a request stuck on a sleeping host must not hold the
+      // probe for longer than HEALTH_TRY_TIMEOUT_MS.
+      const controller = new AbortController()
+      const abortTimer = window.setTimeout(() => controller.abort(), HEALTH_TRY_TIMEOUT_MS)
+      try {
+        const response = await fetch(`${API_BASE}/api/health`, {
+          signal: controller.signal,
+          cache: 'no-store',
+        })
+        if (response.ok) {
+          if (!cancelled) setHealthState('ready')
+          return
+        }
+      } catch {
+        // Network failure or the 8s abort — fall through and retry.
+      } finally {
+        window.clearTimeout(abortTimer)
+      }
+
+      if (cancelled) return
+      if (Date.now() - startedAt >= HEALTH_GIVE_UP_MS) {
+        giveUp()
+        return
+      }
+      // Keep the 3s cadence measured from the attempt's start.
+      const wait = Math.max(0, HEALTH_POLL_INTERVAL_MS - (Date.now() - attemptAt))
+      retryTimer = window.setTimeout(() => {
+        void tryOnce()
+      }, wait)
+    }
+
+    const wakeTimer = window.setTimeout(() => {
+      // Never downgrade an outcome that already landed.
+      if (!cancelled) {
+        setHealthState((prev) => (prev === 'ready' || prev === 'failed' ? prev : 'waking'))
+      }
+    }, HEALTH_WAKE_DELAY_MS)
+
+    void tryOnce()
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(retryTimer)
+      window.clearTimeout(wakeTimer)
+    }
+  }, [])
+
+  // The only notice this flow raises: the 120s deadline. Everything else is
+  // the persistent wake-up line rendered under the header.
+  useEffect(() => {
+    if (healthState === 'failed') showNotice(WAKE_FAILED_MESSAGE, { kind: 'error' })
+  }, [healthState, showNotice])
 
   // ── Stage 1: Idle ──────────────────────────────────────────────────────
 
@@ -594,6 +696,9 @@ function App() {
 
   const trimmedRepoUrl = repoUrl.trim()
   const repoUrlValid = trimmedRepoUrl.startsWith(REPO_URL_PREFIX)
+  // Cold-start lock: only while the wake-up line is on screen (so a fast,
+  // healthy first response never blocks the form).
+  const serverWaking = healthState === 'waking'
   // Only nag once the user has actually typed something invalid.
   const showRepoHint = trimmedRepoUrl.length > 0 && !repoUrlValid
 
@@ -758,6 +863,19 @@ function App() {
         </p>
       </header>
 
+      {/* ── Cold-start line (persistent, NOT a Notice) ── */}
+      {/* Render's backend sleeps after ~15 min idle and takes ~1 min to wake,
+          so this line stays on screen until /api/health answers. It is
+          deliberately not a Notice: every banner in the notice slot
+          auto-dismisses after 5s, and this one must never disappear while the
+          server is still down. */}
+      {healthState === 'waking' && (
+        <div className="wake-status" role="status" aria-live="polite">
+          <span className="wake-status-spinner" aria-hidden="true" />
+          <span>{WAKE_MESSAGE}</span>
+        </div>
+      )}
+
       <main className="main">
         {/* ── Notice ── */}
         {/* Every banner/note in the app renders here through the shared
@@ -790,7 +908,10 @@ function App() {
               className="repo-form"
               onSubmit={(e) => {
                 e.preventDefault()
-                if (repoUrlValid) handleStartPlanning()
+                // `serverWaking` re-checks the Enter-key path, not just the
+                // disabled button: a plan request against a sleeping backend
+                // would only produce a connection error.
+                if (repoUrlValid && !serverWaking) handleStartPlanning()
               }}
             >
               <label className="repo-label" htmlFor="repo-url">
@@ -822,8 +943,12 @@ function App() {
                 dependencies or build tooling.
               </p>
 
-              <button className="btn btn--primary" type="submit" disabled={!repoUrlValid}>
-                Start Planning
+              <button
+                className="btn btn--primary"
+                type="submit"
+                disabled={!repoUrlValid || serverWaking}
+              >
+                {serverWaking ? 'Waking up server...' : 'Start Planning'}
               </button>
             </form>
           </div>
