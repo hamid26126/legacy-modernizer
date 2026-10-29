@@ -1,7 +1,176 @@
-body {
+/* ─────────────────────────────────────────────────────────────────────────
+   Design tokens — the single source of truth for colour, spacing, radius,
+   shadow, type and motion. Every rule in App.css reads from these; no
+   component hard-codes a value that could live here.
+
+   One accent colour (--color-accent) drives links, focus rings, primary
+   buttons, active steps and progress fills. Its hover/soft/on-accent
+   partners are derived shades of that same hue, not extra accents.
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  /* ── Colour ── */
+  --color-bg: #f6f7fb;
+  --color-surface: #ffffff;
+  --color-surface-alt: #f1f3f9;
+  --color-text: #16182b;
+  --color-text-secondary: #565d70;
+  --color-text-muted: #626980;
+  --color-border: #e3e6ee;
+  --color-border-strong: #c9cedb;
+
+  /* The one accent */
+  --color-accent: #4f46e5;
+  --color-accent-hover: #4338ca;
+  --color-accent-active: #3730a3;
+  --color-accent-light: #eef0ff;
+  --color-accent-soft: #d9ddff;
+  --color-on-accent: #ffffff;
+
+  --color-success: #0f9d6e;
+  --color-success-bg: #e9f8f2;
+  --color-success-border: #a7e7d1;
+  --color-success-text: #0a5c41;
+
+  --color-error: #dc2626;
+  --color-error-bg: #fef1f1;
+  --color-error-border: #f6c9c9;
+  --color-error-text: #991b1b;
+
+  --color-warning: #d97706;
+  --color-warning-bg: #fff8ea;
+  --color-warning-border: #f7ddad;
+  --color-warning-text: #92400e;
+
+  --color-info: #1d4ed8;
+  --color-info-bg: #eaf1ff;
+  --color-info-border: #bfd3ff;
+
+  --color-pending: #5d6473;
+  --color-pending-bg: #f1f3f7;
+  --color-running: #1d4ed8;
+  --color-running-bg: #e6efff;
+  --color-running-border: #9ec1ff;
+  --color-slate: #475569;
+  --color-slate-bg: #f1f5f9;
+  --color-slate-border: #cbd5e1;
+
+  /* Terminal blocks (the "Run it locally" command) */
+  --color-code-bg: #1d2033;
+  --color-code-text: #e7e9f5;
+
+  /* ── Spacing scale ── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+  --space-9: 80px;
+
+  /* ── Radius ── */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+
+  /* ── Shadows ── */
+  --shadow-sm: 0 1px 2px rgba(22, 24, 43, 0.06);
+  --shadow-md: 0 4px 6px -1px rgba(22, 24, 43, 0.08), 0 2px 4px -2px rgba(22, 24, 43, 0.06);
+  --shadow-lg: 0 10px 15px -3px rgba(22, 24, 43, 0.09), 0 4px 6px -4px rgba(22, 24, 43, 0.05);
+  --shadow-focus: 0 0 0 3px rgba(79, 70, 229, 0.25);
+  --shadow-focus-error: 0 0 0 3px rgba(220, 38, 38, 0.22);
+
+  /* ── Type scale ── */
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', 'Fira Mono', ui-monospace, Consolas, monospace;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-base: 15px;
+  --fs-md: 16px;
+  --fs-lg: 18px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+  --fs-hero: clamp(26px, 3.4vw, 38px);
+  --lh-tight: 1.25;
+  --lh-normal: 1.6;
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+
+  /* ── Layout & motion ── */
+  --content-max: 880px;
+  --header-pad-y: var(--space-5);
+  --transition-fast: 150ms ease;
+}
+
+/* ── Reset & base ──────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
   margin: 0;
+  padding: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  background: var(--color-bg);
+  color: var(--color-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 #root {
   min-height: 100vh;
+}
+
+/* ── Visible focus everywhere (keyboard users) ─────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Inputs paint their own ring (border + shadow) on :focus, so keep the
+   generic outline off them without ever hiding the ring. */
+input:focus-visible {
+  outline: none;
+}
+
+::selection {
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+/* ── Reduced motion ────────────────────────────────────────────────────── */
+/* Decorative transitions and fade-ins are dropped; status spinners MUST keep
+   rotating (a frozen ring reads as "stuck" / broken), so they are excluded
+   and slowed slightly instead of being stopped. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+  }
+
+  .review,
+  .executing,
+  .complete {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+
+  .spinner,
+  .badge-spinner,
+  .wake-status-spinner {
+    animation-duration: 2s !important;
+  }
 }

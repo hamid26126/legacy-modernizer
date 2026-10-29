@@ -66,7 +66,11 @@ type MigrateEvent =
       type: 'execution_complete'
       results: MigrationResult[]
       verified?: boolean
-      attempts?: number
+      /** Authoritative run counters — the backend numbers build and lint on
+       *  INDEPENDENT budgets (build_attempt / lint_attempt in executor.py).
+       *  Omitted entirely on the sandbox-setup-failure path. */
+      build_attempts?: number
+      lint_attempts?: number
     }
 
 type Stage = 'idle' | 'planning' | 'review' | 'executing' | 'complete'
@@ -103,14 +107,129 @@ type TimelineEntry =
 
 interface FinalSummary {
   verified: boolean
-  attempts: number
+  /** Authoritative counts from execution_complete; null when the event
+   *  omitted them (sandbox-setup failure), so the timeline is used instead. */
+  buildAttempts: number | null
+  lintAttempts: number | null
+  /** Last attempt number seen in any event — notice-text fallback. */
+  lastAttempt: number
 }
 
-/** Known-working example repo, pre-filled so a demo is always one click away. */
-const DEFAULT_REPO_URL = 'https://github.com/coryjquirk/weather-dashboard'
+/**
+ * Which timeline rows have already settled, decided by POSITION in the
+ * append-only list (a later event ends an earlier row's phase).
+ *
+ * Attempt numbers are deliberately NOT consulted: the backend runs build and
+ * lint on independent counters, so "attempt 1 — build failed" and
+ * "attempt 1 — lint failed" are different rows that must never settle (or
+ * share an output toggle with) each other.
+ */
+function computeRowSettled(timeline: TimelineEntry[]): boolean[] {
+  const settled = new Array<boolean>(timeline.length).fill(true)
+  let seenResult = false // a verify_result appears later in the list
+  let seenPhaseMove = false // a verify_result OR lint_check appears later
+  const fixedPaths = new Set<string>()
+  for (let i = timeline.length - 1; i >= 0; i--) {
+    const row = timeline[i]
+    switch (row.kind) {
+      case 'verify_result':
+        settled[i] = true
+        seenResult = true
+        seenPhaseMove = true
+        break
+      case 'lint_check':
+        // The lint run this row announced is over once any result lands.
+        settled[i] = seenResult
+        seenPhaseMove = true
+        break
+      case 'verify_start':
+        // Covers sandbox setup + the first build; ends when the build phase
+        // moves on (lint starts, or a result lands).
+        settled[i] = seenPhaseMove
+        break
+      case 'fixed':
+        fixedPaths.add(row.newPath)
+        settled[i] = true
+        break
+      case 'fixing':
+        // One file's fix is done once its "fixed" row lands, or once the
+        // verification phase has moved on without it.
+        settled[i] = seenPhaseMove || fixedPaths.has(row.newPath)
+        break
+      default:
+        settled[i] = true
+    }
+  }
+  return settled
+}
+
+/** Known-working example, offered as a one-click chip. It is also the default
+ *  input value, so the demo is always one click away. */
+const EXAMPLE_REPO = {
+  label: 'Weather dashboard',
+  url: 'https://github.com/coryjquirk/weather-dashboard',
+} as const
+
+const DEFAULT_REPO_URL: string = EXAMPLE_REPO.url
 
 /** Backend accepts only github.com hosts (repo_fetch.validate_github_url). */
 const REPO_URL_PREFIX = 'https://github.com/'
+
+/** Step-indicator labels; the active step is derived from `stage`. */
+const STEPS = ['Repo', 'Plan', 'Migrate and verify', 'Download'] as const
+
+/** Which step each stage sits on — display mapping only, drives no logic. */
+const STAGE_STEP: Record<Stage, number> = {
+  idle: 0,
+  planning: 1,
+  review: 1,
+  executing: 2,
+  complete: 3,
+}
+
+/** The one command shown (and copied) on the result screen. */
+const LOCAL_RUN_CMD = 'npm install && npm run dev'
+
+/** "3m 07s" — the elapsed readout used by the run and result cards. */
+function formatElapsed(totalSeconds: number): string {
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}m ${String(seconds).padStart(2, '0')}s`
+}
+
+/**
+ * Live elapsed-time readout. The 1s interval lives HERE, so only this tiny
+ * node re-renders each tick — the rest of the page keeps its last render.
+ * `running` turns the interval on/off: while a run is on screen it counts;
+ * when the stream ends the prop flips and the last tick stays on screen. The
+ * result card mounts already frozen (running=false) and stamps mount time,
+ * which is when the run finished.
+ */
+function ElapsedTimer({
+  startedAt,
+  running = true,
+  className,
+}: {
+  startedAt: number | null
+  running?: boolean
+  className?: string
+}) {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!running) return
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [running])
+
+  if (startedAt === null) {
+    return <span className={className}>0m 00s</span>
+  }
+  // A resumed run re-stamps startedAt; a stale `now` from the previous run
+  // then clamps to 0 until the next tick lands.
+  const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
+  return <span className={className}>{formatElapsed(seconds)}</span>
+}
 
 /**
  * Cold-start probe for a sleeping host (Render sleeps after ~15 min idle and
@@ -180,7 +299,10 @@ function App() {
   // Verification timeline state
   const [timeline, setTimeline] = useState<TimelineEntry[]>([])
   const [verificationStarted, setVerificationStarted] = useState(false)
-  const [expandedAttempts, setExpandedAttempts] = useState<Record<number, boolean>>({})
+  // Output-block expansion for failed verify_result rows, keyed by TIMELINE
+  // ROW INDEX. Never by attempt number: build and lint failures can share an
+  // attempt number (independent backend counters) and must stay independent.
+  const [expandedRows, setExpandedRows] = useState<Record<number, boolean>>({})
   const [finalSummary, setFinalSummary] = useState<FinalSummary | null>(null)
   const [currentAttempt, setCurrentAttempt] = useState(0)
   // Live status line for Stage 4 — updated per phase (build, lint, fix) so the
@@ -189,6 +311,13 @@ function App() {
 
   // On-mount health probe: 'pending' → ('waking' →) 'ready', or 'failed'.
   const [healthState, setHealthState] = useState<HealthState>('pending')
+
+  // Presentation-only start stamp behind the elapsed-time readouts: set when
+  // a run begins, never consulted by any decision-making code. The live tick
+  // lives inside ElapsedTimer so only that node re-renders each second.
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null)
+  // Copy-button feedback for the "Run it locally" command.
+  const [commandCopied, setCommandCopied] = useState(false)
 
   const eventSourceRef = useRef<EventSource | null>(null)
   const lastAttemptRef = useRef(0)
@@ -285,6 +414,13 @@ function App() {
     if (healthState === 'failed') showNotice(WAKE_FAILED_MESSAGE, { kind: 'error' })
   }, [healthState, showNotice])
 
+  // Auto-clear the "Copied" confirmation shortly after a successful copy.
+  useEffect(() => {
+    if (!commandCopied) return
+    const id = window.setTimeout(() => setCommandCopied(false), 2000)
+    return () => window.clearTimeout(id)
+  }, [commandCopied])
+
   // ── Stage 1: Idle ──────────────────────────────────────────────────────
 
   // Always plans the URL currently in the input — there is deliberately no
@@ -307,7 +443,7 @@ function App() {
     setExpandedCards({})
     setTimeline([])
     setVerificationStarted(false)
-    setExpandedAttempts({})
+    setExpandedRows({})
     setFinalSummary(null)
     setExecutingStatus('')
     lastAttemptRef.current = 0
@@ -408,11 +544,15 @@ function App() {
     setStage('executing')
     dismissNotice()
 
+    // Display only: the elapsed-time readout counts from this moment, and a
+    // resumed run starts a fresh clock. Nothing else reads this stamp.
+    setRunStartedAt(Date.now())
+
     // Verification timeline state — always fresh, so a retry gets its own
     // clean Build Verification section.
     setTimeline([])
     setVerificationStarted(false)
-    setExpandedAttempts({})
+    setExpandedRows({})
     setFinalSummary(null)
     setExecutingStatus('')
     lastAttemptRef.current = 0
@@ -453,8 +593,12 @@ function App() {
       }
       // The stream is over: retire any in-flight verification spinners so
       // the timeline can't spin forever behind the error banner.
-      const attempts = lastAttemptRef.current
-      setFinalSummary((prev) => prev ?? { verified: false, attempts })
+      setFinalSummary((prev) => prev ?? {
+        verified: false,
+        buildAttempts: null,
+        lintAttempts: null,
+        lastAttempt: lastAttemptRef.current,
+      })
     }
 
     es.onmessage = (event) => {
@@ -577,15 +721,23 @@ function App() {
             if (eventSourceRef.current === es) eventSourceRef.current = null
             // Stop here: the retry actions belong to the executing view, not
             // the completion screen. Settle any in-flight spinners.
-            const attempts = lastAttemptRef.current
-            setFinalSummary((prev) => prev ?? { verified: false, attempts })
+            setFinalSummary((prev) => prev ?? {
+              verified: false,
+              buildAttempts: null,
+              lintAttempts: null,
+              lastAttempt: lastAttemptRef.current,
+            })
             break
           }
 
           case 'execution_complete': {
             const verified = data.verified ?? false
-            const attempts = data.attempts ?? lastAttemptRef.current
-            setFinalSummary({ verified, attempts })
+            setFinalSummary({
+              verified,
+              buildAttempts: data.build_attempts ?? null,
+              lintAttempts: data.lint_attempts ?? null,
+              lastAttempt: lastAttemptRef.current,
+            })
 
             // Apply per-file results: verification outcomes (pass/fail), the
             // sandbox-setup-failure path (unverified) and the generation-phase
@@ -646,7 +798,7 @@ function App() {
     setExpandedCards({})
     setTimeline([])
     setVerificationStarted(false)
-    setExpandedAttempts({})
+    setExpandedRows({})
     setFinalSummary(null)
     setExecutingStatus('')
     lastAttemptRef.current = 0
@@ -668,8 +820,8 @@ function App() {
     setStage(plan ? 'review' : 'idle')
   }, [closeConnection, dismissNotice, plan])
 
-  const toggleOutput = useCallback((attempt: number) => {
-    setExpandedAttempts((prev) => ({ ...prev, [attempt]: !prev[attempt] }))
+  const toggleRowOutput = useCallback((rowIndex: number) => {
+    setExpandedRows((prev) => ({ ...prev, [rowIndex]: !prev[rowIndex] }))
   }, [])
 
   /**
@@ -687,6 +839,39 @@ function App() {
     a.click()
     document.body.removeChild(a)
   }, [jobId])
+
+  /**
+   * Copy the local run command from the result screen. Uses the async
+   * Clipboard API when it is available, falling back to a hidden textarea +
+   * execCommand so the button still works over plain http.
+   */
+  const handleCopyCommand = useCallback(async () => {
+    let copied = false
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(LOCAL_RUN_CMD)
+        copied = true
+      }
+    } catch {
+      copied = false
+    }
+    if (!copied) {
+      const helper = document.createElement('textarea')
+      helper.value = LOCAL_RUN_CMD
+      helper.setAttribute('readonly', '')
+      helper.style.position = 'fixed'
+      helper.style.opacity = '0'
+      document.body.appendChild(helper)
+      helper.select()
+      try {
+        copied = document.execCommand('copy')
+      } catch {
+        copied = false
+      }
+      document.body.removeChild(helper)
+    }
+    if (copied) setCommandCopied(true)
+  }, [])
 
   const toggleCard = useCallback((idx: number) => {
     setExpandedCards((prev) => ({ ...prev, [idx]: !prev[idx] }))
@@ -717,6 +902,50 @@ function App() {
   const retryLabel =
     failedFileCount > 0 ? `Retry failed files (${failedFileCount})` : 'Retry verification'
 
+  // ── Presentation summaries (pure reads of state that already exists) ────
+
+  // Files actually written to disk: everything except untouched/failed ones.
+  const migratedCount = sortedFiles.filter((f) => {
+    const s = fileStatuses[f.path]?.status
+    return s === 'verified' || s === 'unverified' || s === 'generated'
+  }).length
+
+  // ── Result-screen counts ───────────────────────────────────────────────
+  // execution_complete carries the AUTHORITATIVE run counters (the backend
+  // numbers build and lint on independent budgets). The timeline fallbacks
+  // mirror the same semantics for streams that omit the fields: every
+  // completed failed build run leaves a build-stage verify_result, and the
+  // single successful build run that reached lint is implied by the first
+  // lint_check row; every lint run is preceded by exactly one lint_check
+  // row. A "fix pass" is one apply_fix() call the backend made after a
+  // failed result — one pass can fix several files, so FILES are not
+  // counted, and the label says "Fix passes".
+  const buildFailRows = timeline.filter(
+    (r) => r.kind === 'verify_result' && !r.passed && r.stage === 'build',
+  ).length
+  const lintCheckRows = timeline.filter((r) => r.kind === 'lint_check').length
+  const timelineBuildRuns = buildFailRows + (lintCheckRows > 0 ? 1 : 0)
+  const timelineLintRuns = lintCheckRows
+  const timelineFixPasses = timeline.reduce((count, row, i) => {
+    if (row.kind !== 'verify_result' || row.passed) return count
+    const retried = timeline.slice(i + 1).some((later) => later.kind === 'fixing')
+    return retried ? count + 1 : count
+  }, 0)
+
+  const buildRunCount = finalSummary?.buildAttempts ?? timelineBuildRuns
+  const lintRunCount = finalSummary?.lintAttempts ?? timelineLintRuns
+  const fixPassCount = timelineFixPasses
+  // Notice wording: "after N attempts" = the deepest phase's run count, so a
+  // first-try pass reads "after 1 attempt" and a double lint retry reads
+  // "after 3 attempts".
+  const noticeAttempts = Math.max(buildRunCount, lintRunCount, finalSummary?.lastAttempt ?? 0)
+
+  const progressPercent =
+    totalFiles > 0 ? Math.round((generatedCount / totalFiles) * 100) : 0
+
+  // Active step in the header-to-content stepper.
+  const stepIndex = STAGE_STEP[stage]
+
   // ── Final result summary ──────────────────────────────────────────────
   // Rides in the same notice slot as every other banner, but never
   // auto-dismisses: it stays until the user closes it or the stage changes.
@@ -724,16 +953,16 @@ function App() {
     if (stage !== 'complete' || !finalSummary) return
     if (finalSummary.verified) {
       showNotice(
-        `All files verified after ${finalSummary.attempts} attempt${finalSummary.attempts === 1 ? '' : 's'}`,
+        `All files verified after ${noticeAttempts} attempt${noticeAttempts === 1 ? '' : 's'}`,
         { kind: 'success', autoDismiss: false, icon: '✓' },
       )
     } else {
       showNotice(
-        `Verification failed after ${finalSummary.attempts} attempt${finalSummary.attempts === 1 ? '' : 's'} — manual review needed`,
+        `Verification failed after ${noticeAttempts} attempt${noticeAttempts === 1 ? '' : 's'} — manual review needed`,
         { kind: 'error', autoDismiss: false, icon: '⚠' },
       )
     }
-  }, [stage, finalSummary, showNotice])
+  }, [stage, finalSummary, noticeAttempts, showNotice])
 
   // ── Shared sub-render: the file list (identical in Stage 4 and complete) ──
 
@@ -759,7 +988,7 @@ function App() {
               <button
                 className="expand-btn"
                 onClick={() => toggleCard(idx)}
-                aria-label="Toggle migration notes"
+                aria-label={`Toggle migration notes for ${file.path}`}
                 aria-expanded={!!expandedCards[idx]}
               >
                 {expandedCards[idx] ? '▾' : '▸'}
@@ -780,8 +1009,8 @@ function App() {
             {file.depends_on.length > 0 && (
               <div className="depends-on">
                 <span className="depends-label">Depends on:</span>
-                {file.depends_on.map((dep) => (
-                  <span className="dep-chip" key={dep}>
+                {file.depends_on.map((dep, depIdx) => (
+                  <span className="dep-chip" key={`${depIdx}-${dep}`}>
                     {dep}
                   </span>
                 ))}
@@ -795,23 +1024,10 @@ function App() {
 
   // ── Shared sub-render: the build-verification timeline ──
 
-  /**
-   * The timeline is append-only, so a `verify_start` / `fixing` row can never
-   * learn that it finished on its own. Derive which attempts and fixes have
-   * already been settled by a later event instead, so a row shows its spinner
-   * only while it is genuinely still in flight.
-   */
-  const settledAttempts = new Set<number>()
-  const settledFixes = new Set<string>()
-  // The build phase of an attempt is over once lint has started (or the
-  // result landed) — retires the "Verifying full build..." spinner so it
-  // can't keep spinning through the lint phase it no longer describes.
-  const buildSettled = new Set<number>()
-  for (const row of timeline) {
-    if (row.kind === 'verify_result') settledAttempts.add(row.attempt)
-    if (row.kind === 'lint_check' || row.kind === 'verify_result') buildSettled.add(row.attempt)
-    if (row.kind === 'fixed') settledFixes.add(row.newPath)
-  }
+  // Which rows have settled, by position (see computeRowSettled). A row's
+  // spinner runs only while it is genuinely still the newest event of its
+  // phase — attempt numbers are never consulted.
+  const rowSettled = computeRowSettled(timeline)
 
   // execution_complete retires every spinner, even for an attempt that never
   // reported a result (e.g. sandbox setup failed mid-verification).
@@ -839,13 +1055,10 @@ function App() {
             <TimelineRow
               key={i}
               row={row}
-              outputOpen={row.kind === 'verify_result' ? !!expandedAttempts[row.attempt] : false}
-              onToggleOutput={toggleOutput}
+              outputOpen={row.kind === 'verify_result' ? !!expandedRows[i] : false}
+              onToggleOutput={() => toggleRowOutput(i)}
               isLast={i === timeline.length - 1}
-              streamFinished={streamFinished}
-              settledAttempts={settledAttempts}
-              buildSettled={buildSettled}
-              settledFixes={settledFixes}
+              inFlight={!streamFinished && !rowSettled[i]}
             />
           ))}
         </ol>
@@ -857,10 +1070,28 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1 className="title">Legacy Modernization Agent</h1>
-        <p className="subtitle">
-          AI-powered jQuery → React migration, powered by NVIDIA Nemotron on Nebius Token Factory
-        </p>
+        <div className="header-inner">
+          <div className="brand">
+            <svg
+              className="brand-mark"
+              width="32"
+              height="32"
+              viewBox="0 0 64 64"
+              fill="none"
+              aria-hidden="true"
+            >
+              <rect width="64" height="64" rx="16" fill="#4f46e5" />
+              <path
+                d="M20 44V20h8l8 12 8-12h0v24"
+                stroke="#ffffff"
+                strokeWidth="4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            <h1 className="title">Legacy Modernizer</h1>
+          </div>
+        </div>
       </header>
 
       {/* ── Cold-start line (persistent, NOT a Notice) ── */}
@@ -877,6 +1108,31 @@ function App() {
       )}
 
       <main className="main">
+        {/* ── Step indicator ── */}
+        {/* Purely derived from `stage`: every earlier step renders as done,
+            the current one is highlighted with aria-current="step", later
+            ones stay neutral. It carries no click handlers on purpose — the
+            app moves forward only through the actions below. */}
+        <nav className="stepper" aria-label="Migration progress">
+          <ol className="stepper-list">
+            {STEPS.map((label, i) => {
+              const state = i < stepIndex ? 'done' : i === stepIndex ? 'current' : 'todo'
+              return (
+                <li
+                  key={label}
+                  className={`stepper-item stepper-item--${state}`}
+                  aria-current={state === 'current' ? 'step' : undefined}
+                >
+                  <span className="stepper-index" aria-hidden="true">
+                    {state === 'done' ? '✓' : i + 1}
+                  </span>
+                  <span className="stepper-label">{label}</span>
+                </li>
+              )
+            })}
+          </ol>
+        </nav>
+
         {/* ── Notice ── */}
         {/* Every banner/note in the app renders here through the shared
             notice mechanism: dismissible, auto-hiding after 5s (the final
@@ -891,66 +1147,110 @@ function App() {
         {/* ── Stage 1: Idle ── */}
         {stage === 'idle' && (
           <div className="idle">
-            <div className="idle-icon">
-              <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
-                <rect width="64" height="64" rx="16" fill="#EEF2FF" />
-                <path
-                  d="M20 44V20h8l8 12 8-12h0v24"
-                  stroke="#6366F1"
-                  strokeWidth="3"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+            {/* ── Hero ── */}
+            <section className="hero">
+              <h2 className="hero-title">
+                Migrate jQuery apps to React, verified in a real sandbox
+              </h2>
+            </section>
+
+            {/* ── How it works ── */}
+            {/* One compact row: the details live in the repo card below, so
+                these stay to three short numbered items. */}
+            <ol className="how-it-works">
+              <li className="how-step">
+                <span className="how-step-index" aria-hidden="true">
+                  1
+                </span>
+                <span className="how-step-label">Paste a repo</span>
+              </li>
+              <li className="how-step">
+                <span className="how-step-index" aria-hidden="true">
+                  2
+                </span>
+                <span className="how-step-label">AI plans and rewrites</span>
+              </li>
+              <li className="how-step">
+                <span className="how-step-index" aria-hidden="true">
+                  3
+                </span>
+                <span className="how-step-label">Built and linted in a sandbox</span>
+              </li>
+            </ol>
+
+            {/* ── Repo input card ── */}
+            <div className="repo-card">
+              <form
+                className="repo-form"
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  // `serverWaking` re-checks the Enter-key path, not just the
+                  // disabled button: a plan request against a sleeping backend
+                  // would only produce a connection error.
+                  if (repoUrlValid && !serverWaking) handleStartPlanning()
+                }}
+              >
+                <label className="repo-label" htmlFor="repo-url">
+                  Enter a public GitHub repo URL (small-to-medium vanilla jQuery app)
+                </label>
+
+                <input
+                  id="repo-url"
+                  className={`repo-input${showRepoHint ? ' repo-input--invalid' : ''}`}
+                  type="text"
+                  value={repoUrl}
+                  onChange={(e) => setRepoUrl(e.target.value)}
+                  placeholder="https://github.com/owner/repo"
+                  spellCheck={false}
+                  autoComplete="off"
+                  autoCapitalize="off"
+                  aria-invalid={showRepoHint}
+                  aria-describedby={showRepoHint ? 'repo-url-hint' : undefined}
                 />
-              </svg>
+
+                {showRepoHint && (
+                  <p className="repo-hint" id="repo-url-hint">
+                    Must be a public github.com repository URL
+                  </p>
+                )}
+
+                {/* ── Example chip: one click fills the input ── */}
+                <div className="chips">
+                  <span className="chips-label" id="examples-label">
+                    Try an example
+                  </span>
+                  <div className="chip-row" role="group" aria-labelledby="examples-label">
+                    <button
+                      type="button"
+                      className={`chip${trimmedRepoUrl === EXAMPLE_REPO.url ? ' chip--active' : ''}`}
+                      aria-pressed={trimmedRepoUrl === EXAMPLE_REPO.url}
+                      onClick={() => setRepoUrl(EXAMPLE_REPO.url)}
+                    >
+                      {EXAMPLE_REPO.label}
+                    </button>
+                  </div>
+                </div>
+
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={!repoUrlValid || serverWaking}
+                >
+                  {serverWaking ? 'Waking up server...' : 'Start Planning'}
+                </button>
+
+                {/* One muted line inside the card: timing + what works best. */}
+                <p className="repo-note">
+                  Small apps usually take 3 to 5 minutes. Works best on small-to-medium
+                  vanilla jQuery apps.
+                </p>
+              </form>
             </div>
 
-            <form
-              className="repo-form"
-              onSubmit={(e) => {
-                e.preventDefault()
-                // `serverWaking` re-checks the Enter-key path, not just the
-                // disabled button: a plan request against a sleeping backend
-                // would only produce a connection error.
-                if (repoUrlValid && !serverWaking) handleStartPlanning()
-              }}
-            >
-              <label className="repo-label" htmlFor="repo-url">
-                Enter a public GitHub repo URL (small-to-medium vanilla jQuery app)
-              </label>
-
-              <input
-                id="repo-url"
-                className={`repo-input${showRepoHint ? ' repo-input--invalid' : ''}`}
-                type="text"
-                value={repoUrl}
-                onChange={(e) => setRepoUrl(e.target.value)}
-                placeholder="https://github.com/owner/repo"
-                spellCheck={false}
-                autoComplete="off"
-                autoCapitalize="off"
-                aria-invalid={showRepoHint}
-                aria-describedby={showRepoHint ? 'repo-url-hint' : undefined}
-              />
-
-              {showRepoHint && (
-                <p className="repo-hint" id="repo-url-hint">
-                  Must be a public github.com repository URL
-                </p>
-              )}
-
-              <p className="repo-note">
-                Works best on small-to-medium vanilla jQuery apps without heavy external
-                dependencies or build tooling.
-              </p>
-
-              <button
-                className="btn btn--primary"
-                type="submit"
-                disabled={!repoUrlValid || serverWaking}
-              >
-                {serverWaking ? 'Waking up server...' : 'Start Planning'}
-              </button>
-            </form>
+            {/* Second muted line: the credits, kept to a single line. */}
+            <p className="repo-note repo-note--centered">
+              Powered by NVIDIA Nemotron, Nebius Token Factory, Tavily
+            </p>
           </div>
         )}
 
@@ -963,7 +1263,9 @@ function App() {
         {stage === 'planning' && (
           <div className="planning">
             <div className="spinner" />
-            <p className="status-line">{statusMessage || 'Connecting to backend...'}</p>
+            <p className="status-line" role="status" aria-live="polite">
+              {statusMessage || 'Connecting to backend...'}
+            </p>
           </div>
         )}
 
@@ -1009,10 +1311,37 @@ function App() {
               </div>
             )}
 
+            {/* ── Progress: files generated + elapsed time ── */}
+            {/* A real bar (not just a count) so a glance shows how far the
+                generation phase has got; it stays on screen with its final
+                values once the stream ends. */}
+            <div className="run-progress">
+              <div className="run-progress-head">
+                <span className="run-progress-label">Files generated</span>
+                <span className="run-progress-count">
+                  {generatedCount} / {totalFiles}
+                </span>
+                <span className="run-progress-elapsed">
+                  Elapsed <ElapsedTimer startedAt={runStartedAt} />
+                </span>
+              </div>
+              <div
+                className="progress-track"
+                role="progressbar"
+                aria-label="Files generated"
+                aria-valuemin={0}
+                aria-valuemax={Math.max(totalFiles, 1)}
+                aria-valuenow={generatedCount}
+                aria-valuetext={`${generatedCount} of ${totalFiles} files`}
+              >
+                <div className="progress-fill" style={{ width: `${progressPercent}%` }} />
+              </div>
+            </div>
+
             {/* Once the stream is over the spinner is retired, so the UI can't
                 keep "Generating..." spinning behind the error notice. */}
             {!streamFinished && (
-              <div className="executing-status">
+              <div className="executing-status" role="status" aria-live="polite">
                 {verificationStarted ? (
                   <>
                     <div className="spinner" />
@@ -1025,7 +1354,7 @@ function App() {
                   <>
                     <div className="spinner" />
                     <span>
-                      Generating migrated files... {generatedCount}/{totalFiles}
+                      Generating migrated files... {generatedCount} / {totalFiles}
                     </span>
                   </>
                 )}
@@ -1053,22 +1382,107 @@ function App() {
               </div>
             )}
 
+            {/* ── Summary card ── */}
+            {/* Every number here is read straight from state the run already
+                produced — no extra counting logic runs against the backend. */}
+            <section
+              className={`summary-card${finalSummary?.verified ? '' : ' summary-card--warn'}`}
+              aria-label="Run summary"
+            >
+              <div className="summary-head">
+                <span className="summary-icon" aria-hidden="true">
+                  {finalSummary?.verified ? '✓' : '⚠'}
+                </span>
+                <div>
+                  <h2 className="summary-title">
+                    {finalSummary?.verified ? 'Migration complete' : 'Migration finished'}
+                  </h2>
+                  <p className="summary-sub">
+                    {finalSummary?.verified
+                      ? 'Every file built and passed lint in the sandbox.'
+                      : 'Some files still need attention — the timeline below has the details.'}
+                  </p>
+                </div>
+              </div>
+
+              <dl className="stats">
+                <div className="stat">
+                  <dt>Files migrated</dt>
+                  <dd>
+                    {migratedCount} / {totalFiles}
+                  </dd>
+                </div>
+                <div className="stat">
+                  <dt>Build runs</dt>
+                  <dd>{buildRunCount}</dd>
+                </div>
+                <div className="stat">
+                  <dt>Lint runs</dt>
+                  <dd>{lintRunCount}</dd>
+                </div>
+                <div className="stat">
+                  <dt>Fix passes</dt>
+                  <dd>{fixPassCount}</dd>
+                </div>
+                <div className="stat">
+                  <dt>Elapsed time</dt>
+                  <dd>
+                    <ElapsedTimer startedAt={runStartedAt} running={false} />
+                  </dd>
+                </div>
+              </dl>
+
+              <div className="summary-actions">
+                {finalSummary?.verified && (
+                  <button className="btn btn--primary btn--lg" onClick={handleDownload}>
+                    Download Migrated App (.zip)
+                  </button>
+                )}
+                <button className="btn btn--secondary" onClick={handleStartOver}>
+                  Start Over
+                </button>
+              </div>
+            </section>
+
+            {/* ── Run it locally ── */}
+            <section className="run-locally">
+              <h2 className="run-locally-title">Run it locally</h2>
+              <div className="code-row">
+                <code className="code-block">{LOCAL_RUN_CMD}</code>
+                <button
+                  type="button"
+                  className={`copy-btn${commandCopied ? ' copy-btn--copied' : ''}`}
+                  onClick={handleCopyCommand}
+                >
+                  {commandCopied ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+              <span className="copy-feedback" role="status" aria-live="polite">
+                {commandCopied ? 'Command copied to clipboard' : ''}
+              </span>
+              <p className="run-locally-note">
+                Unzip the download, open the folder, then run the command above.
+              </p>
+            </section>
+
             {renderVerificationPanel()}
             {renderFileList()}
-
-            <div className="action-bar">
-              {finalSummary?.verified && (
-                <button className="btn btn--primary" onClick={handleDownload}>
-                  Download Migrated App (.zip)
-                </button>
-              )}
-              <button className="btn btn--secondary" onClick={handleStartOver}>
-                Start Over
-              </button>
-            </div>
           </div>
         )}
       </main>
+
+      {/* ── Footer ── */}
+      <footer className="footer">
+        <span>Legacy Modernizer — open source under the MIT License.</span>
+        <a
+          className="footer-link"
+          href="https://github.com/hamid26126/legacy-modernizer"
+          target="_blank"
+          rel="noreferrer"
+        >
+          github.com/hamid26126/legacy-modernizer
+        </a>
+      </footer>
     </div>
   )
 }
@@ -1109,28 +1523,20 @@ function TimelineRow({
   outputOpen,
   onToggleOutput,
   isLast,
-  streamFinished,
-  settledAttempts,
-  buildSettled,
-  settledFixes,
+  inFlight,
 }: {
   row: TimelineEntry
   outputOpen: boolean
-  onToggleOutput: (attempt: number) => void
+  onToggleOutput: () => void
   isLast: boolean
-  streamFinished: boolean
-  settledAttempts: ReadonlySet<number>
-  buildSettled: ReadonlySet<number>
-  settledFixes: ReadonlySet<string>
+  /** Still the newest event of its phase — drives the row spinner only. */
+  inFlight: boolean
 }) {
   let dotClass = 'timeline-dot'
   let body: ReactNode
 
   switch (row.kind) {
     case 'verify_start': {
-      // Spinner runs through the build only — it stops when lint starts or
-      // this attempt's verify_result lands, whichever comes first.
-      const inFlight = !streamFinished && !buildSettled.has(row.attempt)
       if (inFlight) dotClass += ' timeline-dot--active'
       body = (
         <div className="timeline-body">
@@ -1147,9 +1553,6 @@ function TimelineRow({
     }
 
     case 'lint_check': {
-      // Settles as soon as this attempt's verify_result (which follows lint)
-      // lands, so the row never spins after the stream has moved on.
-      const inFlight = !streamFinished && !settledAttempts.has(row.attempt)
       if (inFlight) dotClass += ' timeline-dot--active'
       body = (
         <div className="timeline-body">
@@ -1183,7 +1586,7 @@ function TimelineRow({
               </span>
               <button
                 className="output-toggle"
-                onClick={() => onToggleOutput(row.attempt)}
+                onClick={onToggleOutput}
                 aria-expanded={outputOpen}
               >
                 {outputOpen ? '▾' : '▸'} {outputOpen ? 'Hide' : 'Show'}{' '}
@@ -1202,7 +1605,6 @@ function TimelineRow({
       break
 
     case 'fixing': {
-      const inFlight = !streamFinished && !settledFixes.has(row.newPath)
       if (inFlight) dotClass += ' timeline-dot--active'
       body = (
         <div className="timeline-body">
